@@ -34,7 +34,7 @@ attach_packages <- function(pkgs) {invisible(lapply(pkgs, function(p) {
  	}))
 }
 
-attach_packages(c("DBI", "RPostgres", "dplyr", "tidyr", "dbplyr", "lubridate", "conflicted", "tidyverse", "ggplot2", "fixest", "modelsummary", "purrr", "mgcv", "segmented", "stringr")
+attach_packages(c("DBI", "RPostgres", "dplyr", "tidyr", "dbplyr", "lubridate", "conflicted", "tidyverse", "ggplot2", "fixest", "modelsummary", "purrr", "mgcv", "segmented", "stringr", "renv")
 )
 
 conflicts_prefer(dplyr::filter, dplyr::select, dplyr::mutate, dplyr::arrange, dplyr::summarise,
