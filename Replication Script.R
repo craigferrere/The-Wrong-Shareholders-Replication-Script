@@ -9,8 +9,6 @@
 
 # CONFIG ==================================================================================================
 
-cash_cutoff <- 75
-
 cfg <- list(
 	top_n		= 2500L,
 	sample_n  	= 1000L,
@@ -54,9 +52,11 @@ q_index <- function(qe) {
 }
 
 #=================================================================================================
-# STEP 1: Filter Merger Sample
+# STEP 1: Merger Universe Extraction
 # create intermediate sample before top_n applied
-# Input: wrds connection
+# Input: WRDS SDC M&A details (`sdc.wrds_ma_details`) with filters for completed US public-public 
+# deals (2000–2025), 100% owned targets, and non-missing deal value
+# Transformations: Date/numeric coercion and sample filtering
 # Output: mergers_analysis
 #=================================================================================================
 
@@ -84,9 +84,10 @@ mergers_analysis <- tbl(wrds, in_schema("sdc", "wrds_ma_details")) %>%
  		)
 
 #=================================================================================================
-# STEP 2: Attach PERMNO
-# Input: mergers_analysis
-# Output: mergers_analysis with target_permno, target_n_permno, acquirer_permno, acquirer_n_permno
+# STEP 2: Target/acquirer CRSP identity mapping
+# Input: mergers_analysis, CRSP stocknames_v2, stocknames, ccm_lookup
+# Transformation: multi-route CUSIP6/date matching (strict/loose) with ticker fallback for targets; keep best matches
+# Output: mergers_analysis with target_permno, acquirer_permno and match counts
 #=================================================================================================
 
 # ---- acquirer permno ---------------------------------------------------------------------------
@@ -243,6 +244,35 @@ m4b <- xk %>%
 
 matched <- bind_rows(matched, m4b %>% distinct(master_deal_no)) %>% distinct()
 
+tickers <- xk %>%
+ anti_join(matched, by = "master_deal_no") %>%
+ filter(!is.na(ticker)) %>%
+ distinct(ticker) %>%
+ pull(ticker)
+
+sn_t <- if (length(tickers) > 0) {
+ tbl(wrds, in_schema("crsp", "stocknames")) %>%
+   filter(toupper(ticker) %in% tickers) %>%
+   transmute(
+     permno    = permno,
+     ticker    = toupper(ticker),
+     namedt    = as.Date(namedt),
+     nameenddt = as.Date(nameenddt)
+   ) %>%
+   collect()
+} else {
+ tibble(permno = integer(), ticker = character(),
+        namedt = as.Date(character()), nameenddt = as.Date(character()))
+}
+
+m5 <- xk %>%
+ anti_join(matched, by = "master_deal_no") %>%
+ filter(!is.na(ticker)) %>%
+ select(master_deal_no, asof, ticker) %>%
+ left_join(sn_t, by = "ticker", relationship = "many-to-many") %>%
+ filter(!is.na(permno)) %>%
+ pick_best_by_date()
+
 # ---- combine + attach --------------------------------------------------------------------------
 x_map <- bind_rows(m1, m2, m3, m4a, m4b) %>%
  distinct(master_deal_no, permno) %>%
@@ -266,7 +296,7 @@ mergers_analysis <- mergers_analysis %>%
  )
 
 # ---- clear intermediate objects ----------------------------------------------------------------
-rm("ccm","m1","m2","m3","m4a","m4b","m5", "cus6", "sn2_cols", "sn_cols", "sn","sn_t","sn2","x_map","xk", "matched", "ccm_cols", "sn2_cusip_field", "ccm_permno_col")
+rm("ccm","m1","m2","m3","m4a","m4b", "m5", "cus6", "sn2_cols", "sn_cols", "sn","sn_t","sn2","x_map","xk", "matched", "ccm_cols", "sn2_cusip_field", "ccm_permno_col")
 
 # ---- target permno -----------------------------------------------------------------------------
 # ---- keys --------------------------------------------------------------------------------------
@@ -462,6 +492,7 @@ rm("ccm","m1","m2","m3","m4a","m4b","m5", "cus6", "sn2_cols", "sn_cols", "sn","s
 #=================================================================================================
 # STEP 3: Finalize Merger Sample for Institutional Ownership
 # Input:  mergers_analysis
+# Transformations: Event-quarter construction (t_0, t_m1, t_end), close-date eligibility (dateeff > t_0), top-N by deal value
 # Output: mergers
 #=================================================================================================
 
@@ -498,7 +529,9 @@ rm("mergers_analysis")
 
 #=================================================================================================
 # STEP 4: Build Granular Institutional Ownership Panel (with Aquirer Controls)
-# Input:  mergers
+# Input:  mergers, CRSP monthly files (msf, msenames), Thomson 13F (tfn.s34type1, tfn.s34type3)
+# Transformations: Pull merger and sampled non-merger control PERMNOs, construct first-vintage filer-quarter panel
+# pull holdings in chunks by `fdate`; map CUSIP to PERMNO, join CRSP adjustment factors and compute split-adjusted shares 
 # Output: institutional_ownership_granular
 #=================================================================================================
 
@@ -742,8 +775,9 @@ gc()
 
 #=================================================================================================
 # STEP 5: Calculate Institutional Metrics at Security Level
-# Input:  institutional_holdings_granular
-# Output: institutional_ownership_timeseries, top_deals_timeseries, control_firms_timeseries
+# Input:  institutional_holdings_granular, CRSP quarter-end shares outstanding
+# Transformations: Roll up to permno-quarter (IOR, IOC_HHI, counts, missingness flags)
+# Output: institutional_ownership_timeseries (io_rollup)
 #=================================================================================================
 
 # ---- simple firm-quarter rollup ----------------------------------------------------------------
@@ -800,11 +834,15 @@ rm("io_hhi", "crsp_m")
 gc()
 
 #=================================================================================================
-# STEP 6: Create Target Panel (Top sample_n Deals with IO Data)
+# STEP 6: Create Event Study Panels (Top sample_n Deals with IO Data)
 # Input:  mergers, io_rollup
-# Output: target_panel
+# Transformation: build target_panel and acquirer_panel with event time/buckets,
+# build matched non-merger control panel from CRSP candidate universe via IO/size distance matching,
+# create DiD panels (matched_panel, full_panel) with post indicators
+# Output: target_panel, acquirer_panel, control_panel, matched_panel, full_panel
 #=================================================================================================
 
+# ---- TARGET PANEL ------------------------------------------------------------------------------
 # ---- Identify deals with IO data available -----------------------------------------------------
 
 deals_with_io <- mergers %>%
@@ -868,15 +906,9 @@ filter(rdate <= t_end)  # Only keep quarters up to (but not after) completion
 saveRDS(target_panel, "target_panel.rds")
 
 # ---- memory cleanup ----------------------------------------------------------------------------
-rm("io_hhi", "crsp_m")
 gc()
 
-#=================================================================================================
-# STEP 7: Create Acquirer Panel (Matched Controls)
-# Input:  deals_with_io, io_rollup
-# Output: acquirer_panel
-#=================================================================================================
-
+# ---- ACQUIRER PANEL ----------------------------------------------------------------------------
 acquirer_panel <- deals_with_io %>%
 inner_join(
   io_rollup,
@@ -906,11 +938,8 @@ filter(rdate <= t_end)  # Truncate at merger close (same as targets)
 
 saveRDS(acquirer_panel, "acquirer_panel.rds")
 
-#=================================================================================================
-# STEP 8: Match Controls
-# Input: target_panel, io_rollup
-# Output: control_permnos #=================================================================================================
-
+# ---- MATCH CONTROLS ----------------------------------------------------------------------------
+	   
 # ---- configuration -----------------------------------------------------------------------------
 CONTROL_TARGET_RATIO <- 2
 n_controls_target <- n_distinct(target_panel$target_permno) * CONTROL_TARGET_RATIO
@@ -1063,12 +1092,7 @@ print(p_overlap)
 # ---- Return matched control permnos ------------------------------------------------------------
 control_permnos <- control_permnos_matched
 
-#=================================================================================================
-# STEP 9: Create Control Panel (Non-Merger Firms)
-# Input:  control_permnos, io_rollup, target_panel
-# Output: control_panel
-#=================================================================================================
-
+# ---- CREATE CONTROL PANEL (NON-MERGER FIRMS) ---------------------------------------------------
 # ---- Get date range from target panel ----------------------------------------------------------
 date_range <- target_panel %>%
 summarise(
@@ -1109,7 +1133,7 @@ rm("date_range", "candidate_permnos", "candidate_chars", "target_chars", "matche
     "control_permnos_matched", "overlap_data")
 
 #=================================================================================================
-# STEP 10: Combine All Panels
+# STEP 7: Combine All Panels
 # Input: target_panel, acquirer_panel, control_panel
 # Output: full_panel, matched_panel
 #=================================================================================================
@@ -1139,9 +1163,8 @@ saveRDS(matched_panel, "matched_panel.rds")
 saveRDS(full_panel, "full_panel.rds")
 
 #=================================================================================================
-# STEP 11: EVENT STUDY: Institutional Ownership Levels (Targets Only)
-# Input: target_panel
-# Output: Table printed to terminal
+# STEP 8: EVENT STUDY: Institutional Ownership Levels (Targets Only)
+# Event-study regressions: IOR levels around announcement (all/cash/stock subsamples, trend-break specs)
 #=================================================================================================
 
 # ---- Prepare data ------------------------------------------------------------------------------
@@ -1947,7 +1970,7 @@ rm("entrants_with_volume", "inst_breadth")
 #=================================================================================================
 
 # ---- data structure analysis -------------------------------------------------------------------
-timing_data <- deal_flows %>%
+timing_data <- deals_panel %>%
   left_join(
     deals_with_io %>% select(master_deal_no, target_permno, dateann),
     by = c("master_deal_no", "permno" = "target_permno")
@@ -2841,46 +2864,6 @@ daily_data <- crsp_daily %>%
    days_rel = as.numeric(date - dateann),
    ret_excess = ret - rf
  )
-
-# Now the rolling metrics will work because acquirer_ret exists
-risk_metrics <- daily_data %>%
- arrange(master_deal_no, date) %>%
- group_by(master_deal_no) %>%
- mutate(
-   mkt_beta = slide2_dbl(
-     ret_excess, mktrf,
-     ~{
-       if (sum(!is.na(.x) & !is.na(.y)) < 30) return(NA_real_)
-       cov(.x, .y, use = "complete.obs") / var(.y, use = "complete.obs")
-     },
-     .before = 59, .complete = FALSE
-   ),
-
-   mkt_corr = slide2_dbl(
-     ret, mktrf,
-     ~{
-       if (sum(!is.na(.x) & !is.na(.y)) < 30) return(NA_real_)
-       cor(.x, .y, use = "complete.obs")
-     },
-     .before = 59, .complete = FALSE
-   ),
-
-   acq_corr = slide2_dbl(
-     ret, acquirer_ret,
-     ~{
-       if (sum(!is.na(.x) & !is.na(.y)) < 30) return(NA_real_)
-       cor(.x, .y, use = "complete.obs")
-     },
-     .before = 59, .complete = FALSE
-   ),
-
-   idio_vol = slide_dbl(
-     ret_excess,
-     ~sd(.x, na.rm = TRUE),
-     .before = 59, .complete = FALSE
-   )
- ) %>%
- ungroup()
 
 # Calculate rolling metrics (60-day windows)
 
