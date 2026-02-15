@@ -1,0 +1,3397 @@
+##################################################################################################
+# REPLICATION SCRIPT:
+# "The Wrong Shareholders: Why Merger Abitragers Now Control M&A Approval"
+#
+# Precursor: wrds connection
+#
+##################################################################################################
+
+
+# CONFIG ==================================================================================================
+
+cash_cutoff <- 75
+
+cfg <- list(
+ 	top_n		= 2500L,
+ 	sample_n  	= 1000L,
+ 	control_firms_n = 4000,
+ 	winsorization 	= 1.20,
+ 	begin_date	= as.Date("2000-01-01"),
+ 	end_date	= as.Date("2025-01-01"),
+ 	vars 		= c("master_deal_no", "dateann", "dateeff", "aup", "tup", "master_cusip",
+ 			    "acusip", "tticker", "tip", "status", "tpublic", "apublic",
+ 			    "pct_cash", "pct_stk", "pct_other", "pct_unknown",
+ 			    "pctacq", "pctown",
+ 			    "tnationcode", "anationcode", "deal_value"
+ 			     ),
+ 	date_vars	= c("dateann", "dateeff"),
+ 	numeric_vars	= c("deal_value", "pct_cash", "pct_stk", "pct_other", "pct_unknown", 				    "pctacq", "pctown")
+)
+
+attach_packages <- function(pkgs) {invisible(lapply(pkgs, function(p) {
+ 	if (!requireNamespace(p, quietly = TRUE)) stop("Missing package: ", p, call. = FALSE)
+ 	suppressPackageStartupMessages(library(p, character.only = TRUE))
+  	}))
+}
+
+attach_packages(c("DBI", "RPostgres", "dplyr", "tidyr", "dbplyr", "lubridate", "conflicted", 	"tidyverse", "fixest", "ggplot2", "fixest", "modelsummary", "purrr", "mgcv", "segmented", 	"stringr")
+)
+
+conflicts_prefer(dplyr::filter, dplyr::select, dplyr::mutate, dplyr::arrange, dplyr::summarise,
+ 	dplyr::slice, dplyr::lag
+)
+
+qend <- function(x) lubridate::ceiling_date(as.Date(x), "quarter") - lubridate::days(1)
+
+qend_prev <- function(x) {lubridate::floor_date(as.Date(x), "quarter") - lubridate::days(1)
+}
+
+qseq <- function(from, to) seq.Date(as.Date(from), as.Date(to), by = "quarter")
+
+q_index <- function(qe) {
+  	qe <- as.Date(qe)
+  	lubridate::year(qe) * 4L + lubridate::quarter(qe)
+}
+
+#=================================================================================================
+# STEP 1: Filter Merger Sample
+# create intermediate sample before top_n applied
+# Input: wrds connection
+# Output: mergers_analysis
+#=================================================================================================
+
+mergers_analysis <- tbl(wrds, in_schema("sdc", "wrds_ma_details")) %>%
+  		select(all_of(cfg$vars)) %>%
+  		filter(
+    			dateann >= cfg$begin_date,
+    			dateann <  cfg$end_date,
+    			status == "Completed",
+    			tpublic == "Public",
+    			apublic == "Public",
+    			tnationcode == "US",
+    			anationcode == "US",
+    			(aup != tup),
+ 			!is.na(deal_value)
+ 		) %>%
+  			collect() %>%
+  		mutate(
+    			across(all_of(cfg$date_vars), as.Date),
+    			across(all_of(cfg$numeric_vars), as.numeric)
+  		) %>%
+  		filter(
+    			!is.na(pctown),
+    			pctown == 100
+  		)
+
+#=================================================================================================
+# STEP 2: Attach PERMNO
+# Input: mergers_analysis
+# Output: mergers_analysis with target_permno, target_n_permno, acquirer_permno, acquirer_n_permno
+#=================================================================================================
+
+# ---- acquirer permno ---------------------------------------------------------------------------
+# ---- helpers -----------------------------------------------------------------------------------
+pick_best_by_date <- function(df, asof_col = "asof", start_col = "namedt", end_col = "nameenddt") {
+  asof <- df[[asof_col]]
+  st   <- df[[start_col]]
+  en   <- df[[end_col]]
+  overlap <- !is.na(st) & !is.na(en) & st <= asof & asof <= en
+ 
+  # Distance: 0 if overlap, else days to nearest boundary
+  dist <- if_else(overlap, 0,
+                  pmin(abs(as.numeric(st - asof)),
+                       abs(as.numeric(asof - en)),
+                       na.rm = TRUE))
+ 
+  df$._overlap <- overlap
+  df$._dist <- dist
+  df %>%
+    group_by(master_deal_no) %>%
+    arrange(desc(._overlap), ._dist) %>%
+    slice_head(n = 1) %>%
+    ungroup() %>%
+    select(-._overlap, -._dist)
+}
+
+# ---- keys --------------------------------------------------------------------------------------
+xk <- mergers_analysis %>%
+  transmute(
+    master_deal_no = as.character(master_deal_no),
+    asof   = as.Date(dateann),
+    cusip6 = substr(gsub("\\s+", "", acusip), 1, 6)
+  ) %>%
+  mutate(
+    cusip6 = if_else(nchar(cusip6) == 6, cusip6, NA_character_),
+    cusip6 = na_if(cusip6, "")
+  ) %>%
+  distinct(master_deal_no, asof, cusip6)
+
+cus6 <- xk %>% filter(!is.na(cusip6)) %>% distinct(cusip6) %>% pull(cusip6)
+
+
+# ---- pull CRSP sources (restricted) ------------------------------------------------------------
+sn2_cols <- tbl(wrds, in_schema("crsp", "stocknames_v2")) %>% head(1) %>% collect() %>% names()
+sn_cols  <- tbl(wrds, in_schema("crsp", "stocknames"))    %>% head(1) %>% collect() %>% names()
+ccm_cols <- tbl(wrds, in_schema("crsp", "ccm_lookup"))    %>% head(1) %>% collect() %>% names()
+
+# stocknames_v2: pick the best available cusip field (prefer header cusip if present)
+sn2_cusip_field <- dplyr::case_when(
+  "hdrcusip"  %in% sn2_cols ~ "hdrcusip",
+  "hdrcusip9" %in% sn2_cols ~ "hdrcusip9",
+  "cusip"     %in% sn2_cols ~ "cusip",
+  "cusip9"    %in% sn2_cols ~ "cusip9",
+  TRUE                     ~ NA_character_
+)
+
+sn2 <- if (!is.na(sn2_cusip_field)) {
+  tbl(wrds, in_schema("crsp", "stocknames_v2")) %>%
+    transmute(
+      permno    = permno,
+      cusip6    = substr(.data[[sn2_cusip_field]], 1, 6),
+      namedt    = as.Date(namedt),
+      nameenddt = as.Date(nameenddt)
+    ) %>%
+    filter(cusip6 %in% cus6) %>%
+    collect()
+} else {
+  tibble(permno = integer(), cusip6 = character(),
+         namedt = as.Date(character()), nameenddt = as.Date(character()))
+}
+
+sn <- tbl(wrds, in_schema("crsp", "stocknames")) %>%
+  transmute(
+    permno    = permno,
+    cusip6    = substr(ncusip, 1, 6),
+    namedt    = as.Date(namedt),
+    nameenddt = as.Date(nameenddt)
+  ) %>%
+  filter(cusip6 %in% cus6) %>%
+  collect()
+
+ccm_permno_col <- if ("permno" %in% ccm_cols) "permno" else if ("lpermno" %in% ccm_cols) "lpermno" else NA_character_
+ccm <- if (!is.na(ccm_permno_col) && "cusip" %in% ccm_cols) {
+  tbl(wrds, in_schema("crsp", "ccm_lookup")) %>%
+    transmute(
+      cusip6 = substr(cusip, 1, 6),
+      permno = .data[[ccm_permno_col]],
+      linkdt    = if ("linkdt" %in% ccm_cols) as.Date(linkdt) else as.Date(NA),
+      linkenddt = if ("linkenddt" %in% ccm_cols) as.Date(coalesce(linkenddt, as.Date("9999-12-31"))) else as.Date(NA)
+    ) %>%
+    filter(cusip6 %in% cus6) %>%
+    collect()
+} else {
+  tibble(cusip6 = character(), permno = integer(), linkdt = as.Date(character()), linkenddt = as.Date(character()))
+}
+
+# ---- Route 1: stocknames_v2 CUSIP6 with strict overlap -----------------------------------------
+m1 <- xk %>%
+  filter(!is.na(cusip6)) %>%
+  select(master_deal_no, asof, cusip6) %>%
+  left_join(sn2 %>% select(permno, cusip6, namedt, nameenddt), by = "cusip6",
+            relationship = "many-to-many") %>%
+  filter(!is.na(permno), namedt <= asof, asof <= nameenddt) %>%
+  select(master_deal_no, permno) %>%
+  distinct()
+
+matched <- m1 %>% distinct(master_deal_no)
+
+# ---- Route 2: ccm_lookup (strict if link dates exist; else accept) -----------------------------
+m2 <- xk %>%
+  anti_join(matched, by = "master_deal_no") %>%
+  filter(!is.na(cusip6)) %>%
+  select(master_deal_no, asof, cusip6) %>%
+  left_join(ccm, by = "cusip6", relationship = "many-to-many") %>%
+  filter(!is.na(permno)) %>%
+  filter(is.na(linkdt) | is.na(linkenddt) | (linkdt <= asof & asof <= linkenddt)) %>%
+  select(master_deal_no, permno) %>%
+  distinct()
+
+matched <- bind_rows(matched, m2 %>% distinct(master_deal_no)) %>% distinct()
+
+# ---- Route 3: stocknames (strict overlap) ------------------------------------------------------
+m3 <- xk %>%
+  anti_join(matched, by = "master_deal_no") %>%
+  filter(!is.na(cusip6)) %>%
+  select(master_deal_no, asof, cusip6) %>%
+  left_join(sn %>% select(permno, cusip6, namedt, nameenddt), by = "cusip6",
+            relationship = "many-to-many") %>%
+  filter(!is.na(permno), namedt <= asof, asof <= nameenddt) %>%
+  select(master_deal_no, permno) %>%
+  distinct()
+
+matched <- bind_rows(matched, m3 %>% distinct(master_deal_no)) %>% distinct()
+
+# ---- Route 4 (loose): pick closest CUSIP6 window from v2 then stocknames -----------------------
+m4a <- xk %>%
+  anti_join(matched, by = "master_deal_no") %>%
+  filter(!is.na(cusip6)) %>%
+  select(master_deal_no, asof, cusip6) %>%
+  left_join(sn2 %>% select(permno, cusip6, namedt, nameenddt), by = "cusip6",
+            relationship = "many-to-many") %>%
+  filter(!is.na(permno)) %>%
+  pick_best_by_date()
+
+matched <- bind_rows(matched, m4a %>% distinct(master_deal_no)) %>% distinct()
+
+m4b <- xk %>%
+  anti_join(matched, by = "master_deal_no") %>%
+  filter(!is.na(cusip6)) %>%
+  select(master_deal_no, asof, cusip6) %>%
+  left_join(sn %>% select(permno, cusip6, namedt, nameenddt), by = "cusip6",
+            relationship = "many-to-many") %>%
+  filter(!is.na(permno)) %>%
+  pick_best_by_date()
+
+matched <- bind_rows(matched, m4b %>% distinct(master_deal_no)) %>% distinct()
+
+# ---- combine + attach --------------------------------------------------------------------------
+x_map <- bind_rows(m1, m2, m3, m4a, m4b) %>%
+  distinct(master_deal_no, permno) %>%
+  group_by(master_deal_no) %>%
+  summarise(
+    acquirer_permno   = paste(sort(unique(permno)), collapse = ";"),
+    acquirer_n_permno = n_distinct(permno),
+    .groups = "drop"
+  )
+
+mergers_analysis <- mergers_analysis %>%
+  mutate(master_deal_no = as.character(master_deal_no)) %>%
+  select(-any_of(c("acquirer_permno", "acquirer_n_permno"))) %>%
+  left_join(
+    x_map %>% mutate(master_deal_no = as.character(master_deal_no)),
+    by = "master_deal_no"
+  ) %>%
+  mutate(
+    acquirer_permno   = coalesce(acquirer_permno, ""),
+    acquirer_n_permno = coalesce(acquirer_n_permno, 0L)
+  )
+
+# ---- clear objects -----------------------------------------------------------------------------
+rm("ccm","m1","m2","m3","m4a","m4b","m5", "cus6", "sn2_cols", "sn_cols",
+    "sn","sn_t","sn2","x_map","xk", "matched", "ccm_cols", 
+    "sn2_cusip_field", "ccm_permno_col")
+
+# ---- target permno -----------------------------------------------------------------------------
+# ---- keys --------------------------------------------------------------------------------------
+xk <- mergers_analysis %>%
+  transmute(
+    master_deal_no = as.character(master_deal_no),
+    asof   = as.Date(dateann),
+    cusip6 = substr(gsub("\\s+", "", master_cusip), 1, 6),
+    ticker = toupper(trimws(tticker))
+  ) %>%
+  mutate(
+    cusip6 = if_else(nchar(cusip6) == 6, cusip6, NA_character_),
+    cusip6 = na_if(cusip6, ""),
+    ticker = na_if(ticker, "")
+  ) %>%
+  distinct(master_deal_no, asof, cusip6, ticker)
+
+cus6 <- xk %>% filter(!is.na(cusip6)) %>% distinct(cusip6) %>% pull(cusip6)
+
+# ---- pull CRSP sources (restricted) ------------------------------------------------------------
+sn2_cols <- tbl(wrds, in_schema("crsp", "stocknames_v2")) %>% head(1) %>% collect() %>% names()
+sn_cols  <- tbl(wrds, in_schema("crsp", "stocknames"))    %>% head(1) %>% collect() %>% names()
+ccm_cols <- tbl(wrds, in_schema("crsp", "ccm_lookup"))    %>% head(1) %>% collect() %>% names()
+
+# stocknames_v2: pick the best available cusip field (prefer header cusip if present)
+sn2_cusip_field <- dplyr::case_when(
+  "hdrcusip"  %in% sn2_cols ~ "hdrcusip",
+  "hdrcusip9" %in% sn2_cols ~ "hdrcusip9",
+  "cusip"     %in% sn2_cols ~ "cusip",
+  "cusip9"    %in% sn2_cols ~ "cusip9",
+  TRUE                     ~ NA_character_
+)
+
+sn2 <- if (!is.na(sn2_cusip_field)) {
+  tbl(wrds, in_schema("crsp", "stocknames_v2")) %>%
+    transmute(
+      permno    = permno,
+      cusip6    = substr(.data[[sn2_cusip_field]], 1, 6),
+      ticker    = if ("ticker" %in% sn2_cols) toupper(ticker) else NA_character_,
+      namedt    = as.Date(namedt),
+      nameenddt = as.Date(nameenddt)
+    ) %>%
+    filter(cusip6 %in% cus6) %>%
+    collect()
+} else {
+  tibble(permno = integer(), cusip6 = character(), ticker = character(),
+         namedt = as.Date(character()), nameenddt = as.Date(character()))
+}
+
+sn <- tbl(wrds, in_schema("crsp", "stocknames")) %>%
+  transmute(
+    permno    = permno,
+    cusip6    = substr(ncusip, 1, 6),
+    ticker    = toupper(ticker),
+    namedt    = as.Date(namedt),
+    nameenddt = as.Date(nameenddt)
+  ) %>%
+  filter(cusip6 %in% cus6) %>%
+  collect()
+
+ccm_permno_col <- if ("permno" %in% ccm_cols) "permno" else if ("lpermno" %in% ccm_cols) "lpermno" else NA_character_
+ccm <- if (!is.na(ccm_permno_col) && "cusip" %in% ccm_cols) {
+  # keep lean; date fields vary across WRDS installs
+  tbl(wrds, in_schema("crsp", "ccm_lookup")) %>%
+    transmute(
+      cusip6 = substr(cusip, 1, 6),
+      permno = .data[[ccm_permno_col]],
+      linkdt    = if ("linkdt" %in% ccm_cols) as.Date(linkdt) else as.Date(NA),
+      linkenddt = if ("linkenddt" %in% ccm_cols) as.Date(coalesce(linkenddt, as.Date("9999-12-31"))) else as.Date(NA)
+    ) %>%
+    filter(cusip6 %in% cus6) %>%
+    collect()
+} else {
+  tibble(cusip6 = character(), permno = integer(), linkdt = as.Date(character()), linkenddt = as.Date(character()))
+}
+
+# ---- Route 1: stocknames_v2 CUSIP6 with strict overlap -----------------------------------------
+m1 <- xk %>%
+  filter(!is.na(cusip6)) %>%
+  select(master_deal_no, asof, cusip6) %>%
+  left_join(sn2 %>% select(permno, cusip6, namedt, nameenddt), by = "cusip6",
+            relationship = "many-to-many") %>%
+  filter(!is.na(permno), namedt <= asof, asof <= nameenddt) %>%
+  select(master_deal_no, permno) %>%
+  distinct()
+
+matched <- m1 %>% distinct(master_deal_no)
+
+# ---- Route 2: ccm_lookup (strict if link dates exist; else accept) -----------------------------
+m2 <- xk %>%
+  anti_join(matched, by = "master_deal_no") %>%
+  filter(!is.na(cusip6)) %>%
+  select(master_deal_no, asof, cusip6) %>%
+  left_join(ccm, by = "cusip6", relationship = "many-to-many") %>%
+  filter(!is.na(permno)) %>%
+  filter(is.na(linkdt) | is.na(linkenddt) | (linkdt <= asof & asof <= linkenddt)) %>%
+  select(master_deal_no, permno) %>%
+  distinct()
+
+matched <- bind_rows(matched, m2 %>% distinct(master_deal_no)) %>% distinct()
+
+# ---- Route 3: stocknames (strict overlap) ------------------------------------------------------
+m3 <- xk %>%
+  anti_join(matched, by = "master_deal_no") %>%
+  filter(!is.na(cusip6)) %>%
+  select(master_deal_no, asof, cusip6) %>%
+  left_join(sn %>% select(permno, cusip6, namedt, nameenddt), by = "cusip6",
+            relationship = "many-to-many") %>%
+  filter(!is.na(permno), namedt <= asof, asof <= nameenddt) %>%
+  select(master_deal_no, permno) %>%
+  distinct()
+
+matched <- bind_rows(matched, m3 %>% distinct(master_deal_no)) %>% distinct()
+
+# ---- Route 4 (loose): pick closest CUSIP6 window from v2 then stocknames -----------------------
+m4a <- xk %>%
+  anti_join(matched, by = "master_deal_no") %>%
+  filter(!is.na(cusip6)) %>%
+  select(master_deal_no, asof, cusip6) %>%
+  left_join(sn2 %>% select(permno, cusip6, namedt, nameenddt), by = "cusip6",
+            relationship = "many-to-many") %>%
+  filter(!is.na(permno)) %>%
+  pick_best_by_date()
+
+matched <- bind_rows(matched, m4a %>% distinct(master_deal_no)) %>% distinct()
+
+m4b <- xk %>%
+  anti_join(matched, by = "master_deal_no") %>%
+  filter(!is.na(cusip6)) %>%
+  select(master_deal_no, asof, cusip6) %>%
+  left_join(sn %>% select(permno, cusip6, namedt, nameenddt), by = "cusip6",
+            relationship = "many-to-many") %>%
+  filter(!is.na(permno)) %>%
+  pick_best_by_date()
+
+matched <- bind_rows(matched, m4b %>% distinct(master_deal_no)) %>% distinct()
+
+# ---- Route 5: ticker fallback via stocknames (closest window) ----------------------------------
+tickers <- xk %>%
+  anti_join(matched, by = "master_deal_no") %>%
+  filter(!is.na(ticker)) %>%
+  distinct(ticker) %>%
+  pull(ticker)
+
+sn_t <- if (length(tickers) > 0) {
+  tbl(wrds, in_schema("crsp", "stocknames")) %>%
+    filter(toupper(ticker) %in% tickers) %>%
+    transmute(
+      permno    = permno,
+      ticker    = toupper(ticker),
+      namedt    = as.Date(namedt),
+      nameenddt = as.Date(nameenddt)
+    ) %>%
+    collect()
+} else {
+  tibble(permno = integer(), ticker = character(),
+         namedt = as.Date(character()), nameenddt = as.Date(character()))
+}
+
+m5 <- xk %>%
+  anti_join(matched, by = "master_deal_no") %>%
+  filter(!is.na(ticker)) %>%
+  select(master_deal_no, asof, ticker) %>%
+  left_join(sn_t, by = "ticker", relationship = "many-to-many") %>%
+  filter(!is.na(permno)) %>%
+  pick_best_by_date()
+
+# ---- combine + attach --------------------------------------------------------------------------
+x_map <- bind_rows(m1, m2, m3, m4a, m4b, m5) %>%
+  distinct(master_deal_no, permno) %>%
+  group_by(master_deal_no) %>%
+  summarise(
+    target_permno   = paste(sort(unique(permno)), collapse = ";"),
+    target_n_permno = n_distinct(permno),
+    .groups = "drop"
+  )
+
+mergers_analysis <- mergers_analysis %>%
+  mutate(master_deal_no = as.character(master_deal_no)) %>%
+  select(-any_of(c("target_permno", "target_n_permno"))) %>%
+  left_join(
+    x_map %>% mutate(master_deal_no = as.character(master_deal_no)),
+    by = "master_deal_no"
+  ) %>%
+  mutate(
+    target_permno   = coalesce(target_permno, ""),
+    target_n_permno = coalesce(target_n_permno, 0L)
+  )
+
+# ---- clear objects -----------------------------------------------------------------------------
+rm("ccm","m1","m2","m3","m4a","m4b","m5", "cus6", "sn2_cols", "sn_cols",
+    "sn","sn_t","sn2","x_map","xk", "matched", "ccm_cols",
+    "sn2_cusip_field", "ccm_permno_col")
+
+#=================================================================================================
+# STEP 3: Finalize Merger Sample for Institutional Ownership
+# Input:  mergers_analysis
+# Output: mergers
+#=================================================================================================
+
+mergers <- mergers_analysis %>%
+  filter(
+    target_n_permno >= 1L,
+    acquirer_n_permno >= 1L
+  ) %>%
+  mutate(
+    t_0 = qend(dateann),
+    t_m1 = qend_prev(t_0),
+    t_end = if_else(
+      as.Date(dateeff) == qend(dateeff),
+      qend(dateeff),
+      qend_prev(dateeff)
+    ),
+    days_to_t0 = as.integer(t_0 - as.Date(dateann))
+  ) %>%
+  filter(
+    dateeff > t_0  # Exclude deals that closed before quarter-end measurement
+  ) %>%
+  	select(
+   		master_deal_no,
+    		dateann, dateeff, t_0, t_m1, t_end, days_to_t0,
+    		deal_value,
+    		pct_cash, pct_stk, pct_other, pct_unknown,
+    		master_cusip, target_permno, target_n_permno,
+ 		acusip, acquirer_permno, acquirer_n_permno
+  	) %>%
+  	arrange(desc(deal_value)) %>%
+  	slice_head(n = cfg$top_n)
+
+rm(mergers_analysis)
+
+#=================================================================================================
+# STEP 4: Build Granular Institutional Ownership Panel (with Aquirer Controls)
+# Input:  mergers
+# Output: institutional_ownership_granular
+#=================================================================================================
+
+# ---- parameters --------------------------------------------------------------------------------
+begdate <- as.Date("1998-01-01")
+enddate <- as.Date("2025-06-30")
+
+# ---- Get merger firm PERMNOs -------------------------------------------------------------------
+target_permnos <- mergers %>%
+  transmute(permno = suppressWarnings(as.integer(sub(";.*$", "", target_permno)))) %>%
+  filter(!is.na(permno)) %>%
+  distinct(permno) %>%
+  pull(permno)
+
+acquirer_permnos <- mergers %>%
+  transmute(permno = suppressWarnings(as.integer(sub(";.*$", "", acquirer_permno)))) %>%
+  filter(!is.na(permno)) %>%
+  distinct(permno) %>%
+  pull(permno)
+
+# ---- Combine for exclusion from controls -------------------------------------------------------
+merger_permnos <- unique(c(target_permnos, acquirer_permnos))
+
+# ---- Exclude BOTH from controls ----------------------------------------------------------------
+exclude_clause <- paste0("AND a.permno NOT IN (", paste(merger_permnos, collapse = ","), ")")
+control_query <- paste0(
+  "SELECT a.permno ",
+  "FROM crsp.msf a ",
+  "INNER JOIN crsp.msenames b ",
+    "ON a.permno = b.permno ",
+    "AND a.date >= b.namedt ",
+    "AND a.date <= b.nameendt ",
+  "WHERE b.shrcd IN (10, 11) ",
+  exclude_clause, " ",
+  "AND a.date BETWEEN '", begdate, "' AND '", enddate, "' ",
+  "AND ABS(a.prc) * a.shrout > 50000 ",
+  "GROUP BY a.permno ",
+  "HAVING COUNT(*) >= 40 ",
+  "ORDER BY RANDOM() ",
+  "LIMIT ", cfg$control_firms_n
+)
+
+control_permnos <- dbGetQuery(wrds, control_query) %>%
+  	pull(permno)
+
+# ---- Combine -----------------------------------------------------------------------------------
+permnos_needed <- unique(c(merger_permnos, control_permnos))
+
+# ---- create monthly crsp dataset ---------------------------------------------------------------
+# ---- Query CRSP monthly stock file -------------------------------------------------------------
+crsp_msf_query <- paste0("
+SELECT a.permno, a.date, a.prc, a.ret, a.shrout, a.cfacpr, a.cfacshr
+FROM crsp.msf a
+WHERE a.permno IN (", paste(permnos_needed, collapse = ","), ")
+AND a.date >= '", begdate, "'
+AND a.date <= '", enddate, "'
+")
+
+crsp_msf <- dbGetQuery(wrds, crsp_msf_query)
+
+# ---- merger tr-13f s34type1 and s34type3 -------------------------------------------------------
+# ---- Get first vintage for each RDATE-MGRNO combination ----------------------------------------
+s34type1_query <- paste0("
+SELECT rdate, fdate, mgrno, mgrname
+FROM tfn.s34type1
+WHERE rdate >= '", begdate, "'
+AND rdate <= '", enddate, "'
+ORDER BY mgrno, rdate, fdate
+")
+
+s34type1 <- dbGetQuery(wrds, s34type1_query)
+
+# ---- Keep first vintage (earliest fdate) for each manager-quarter ------------------------------
+first_vint <- s34type1 %>%
+group_by(mgrno, rdate) %>%
+arrange(fdate) %>%
+slice(1) %>%
+ungroup()
+
+# ---- Mark first and last reports ---------------------------------------------------------------
+first_vint <- first_vint %>%
+arrange(mgrno, rdate) %>%
+group_by(mgrno) %>%
+mutate(
+First_Report = (row_number() == 1) |
+(as.numeric(difftime(rdate, dplyr::lag(rdate), units = "days")) > 100),
+First_Report = as.integer(First_Report)
+) %>%
+ungroup()
+
+# ---- Mark last reports (reverse order) ---------------------------------------------------------
+first_vint <- first_vint %>%
+arrange(mgrno, desc(rdate)) %>%
+group_by(mgrno) %>%
+mutate(
+Last_Report = (row_number() == 1) |
+(as.numeric(difftime(rdate, dplyr::lag(rdate), units = "days")) > 100),
+Last_Report = as.integer(Last_Report)
+) %>%
+ungroup() %>%
+arrange(mgrno, rdate)
+
+# ---- Add total number of filers per quarter ----------------------------------------------------
+first_vint <- first_vint %>%
+  group_by(rdate) %>%
+  mutate(NumInst = n_distinct(mgrno)) %>%
+  ungroup()
+
+# --- extract holdings and adjust shares ---------------------------------------------------------
+
+# ---- Get all needed fdates ---------------------------------------------------------------------
+fdates_needed <- unique(first_vint$fdate)
+
+# ---- Query s34type3 in chunks ------------------------------------------------------------------
+chunk_size <- 25
+fdate_chunks <- split(fdates_needed, ceiling(seq_along(fdates_needed) / chunk_size))
+
+holdings_list <- list()
+
+for (i in seq_along(fdate_chunks)) {
+  cat(sprintf("  Processing chunk %d/%d...\r", i, length(fdate_chunks)))
+ 
+  s34type3_query <- paste0("
+SELECT fdate, mgrno, cusip, shares
+FROM tfn.s34type3
+WHERE fdate IN ('", paste(fdate_chunks[[i]], collapse = "','"), "')
+AND shares > 0
+ ")
+ 
+  chunk_data <- dbGetQuery(wrds, s34type3_query)
+  holdings_list[[i]] <- chunk_data
+}
+
+s34type3 <- bind_rows(holdings_list)
+gc()
+
+# ---- Merge with first_vint ---------------------------------------------------------------------
+holdings_v1 <- first_vint %>%
+  select(-mgrname) %>%
+  inner_join(s34type3, by = c("fdate", "mgrno"))
+
+# ---- map cusip to permno -----------------------------------------------------------------------
+cusip_query <- paste0("
+SELECT DISTINCT ncusip, permno
+FROM crsp.msenames
+WHERE permno IN (", paste(permnos_needed, collapse = ","), ")
+AND ncusip IS NOT NULL
+AND NOT (
+ COALESCE(nameendt, DATE '9999-12-31') < DATE '", begdate, "'
+ OR namedt > DATE '", enddate, "'
+)
+")
+
+cusip_permno_map <- dbGetQuery(wrds, cusip_query)
+
+# ---- Map to holdings ---------------------------------------------------------------------------
+  holdings_v2 <- holdings_v1 %>%
+    inner_join(cusip_permno_map, by = c("cusip" = "ncusip")) %>%
+    filter(permno %in% permnos_needed)
+
+# ---- build crsp_m with adjustment factors ------------------------------------------------------
+
+# finish processing crsp_msf
+crsp_mse_query <- paste0("
+ SELECT permno, ncusip, shrcd, namedt, nameendt
+ FROM crsp.msenames
+ WHERE permno IN (", paste(permnos_needed, collapse = ","), ")
+   AND NOT (
+     COALESCE(nameendt, DATE '9999-12-31') < DATE '", begdate, "'
+     OR namedt > DATE '", enddate, "'
+   )
+")
+
+crsp_mse <- dbGetQuery(wrds, crsp_mse_query)
+
+# ---- Merge MSF with MSE to get shrcd, then filter to common stocks -----------------------------
+crsp_m <- crsp_msf %>%
+  left_join(
+    crsp_mse %>%
+      select(permno, ncusip, shrcd, namedt, nameendt),
+    by = "permno",
+    relationship = "many-to-many"
+  ) %>%
+  filter(
+    date >= namedt,
+    date <= if_else(is.na(nameendt), as.Date("9999-12-31"), nameendt),
+    shrcd %in% c(10, 11)
+  )
+
+# ---- Adjust shares and align to quarter ends ---------------------------------------------------
+crsp_m <- crsp_m %>%
+  mutate(
+    qdate = ceiling_date(as.Date(date), "quarter") - days(1),
+    date = ceiling_date(as.Date(date), "month") - days(1),
+    P = abs(prc) / cfacpr,
+    TSO = shrout * cfacshr * 1000,
+    TSO = if_else(TSO <= 0, NA_real_, TSO),
+    ME = P * TSO / 1000000
+  ) %>%
+  select(permno, date, qdate, P, TSO, ME, cfacshr, ncusip)
+
+# ---- Keep last monthly observation for each quarter --------------------------------------------
+crsp_m <- crsp_m %>%
+  group_by(permno, qdate) %>%
+  arrange(desc(date)) %>%
+  slice(1) %>%
+  ungroup() %>%
+  select(-date)
+
+# ---- Adjust shares using CRSP factors ----------------------------------------------------------
+holdings <- holdings_v2 %>%
+  inner_join(
+    crsp_m %>% select(permno, qdate, cfacshr),
+    by = c("permno", "rdate" = "qdate")
+  ) %>%
+  mutate(shares_adj = shares * cfacshr) %>%
+  select(rdate, mgrno, NumInst, Last_Report, permno, shares_adj)
+
+gc()
+
+# ---- Convert to data.table and aggregate (faster than dplyr) -----------------------------------
+library(data.table)
+holdings_dt <- as.data.table(holdings)
+
+institutional_holdings_granular <- holdings_dt[,
+  .(shares_adj = sum(shares_adj, na.rm = TRUE),
+    n_cusips = .N),
+  by = .(permno, rdate, mgrno, NumInst, Last_Report)
+]
+
+# ---- Convert back to tibble and save -----------------------------------------------------------
+institutional_holdings_granular <- as_tibble(institutional_holdings_granular)
+
+saveRDS(institutional_holdings_granular, "institutional_holdings_granular.rds")
+
+# ---- clean up ----------------------------------------------------------------------------------
+rm("acquirer_permnos", "holdings_v2", "holdings", "mergers_permnos",
+     "permnos_needed", "crsp_msf", "s34type1", "first_vint", "fdates_needed", "holdings_list",
+     "cusip_permno_map", "crsp_mse")
+gc()
+
+#=================================================================================================
+# STEP 5: Calculate Institutional Metrics at Security Level
+# Input:  institutional_holdings_granular
+# Output: institutional_ownership_timeseries, top_deals_timeseries, control_firms_timeseries
+#=================================================================================================
+
+# ---- simple firm-quarter rollup ----------------------------------------------------------------
+io_rollup <- institutional_holdings_granular %>%
+  group_by(permno, rdate) %>%
+  summarise(
+    n_institutions = n_distinct(mgrno),
+    total_shares_held = sum(shares_adj, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# ---- add adjusted TSO from crsp_m --------------------------------------------------------------
+io_rollup <- io_rollup %>%
+  left_join(
+    crsp_m %>% select(permno, qdate, TSO, P, ME),
+    by = c("permno", "rdate" = "qdate")
+  )
+
+# ---- add IOR -----------------------------------------------------------------------------------
+io_rollup <- io_rollup %>%
+ 	mutate(
+ 		IOR = total_shares_held / TSO,
+ 		IOR_above_threshold = (IOR > cfg$winsorization)
+)
+
+# ---- add IOC_HHI -------------------------------------------------------------------------------
+io_hhi <- institutional_holdings_granular %>%
+  group_by(permno, rdate) %>%
+  summarise(
+    IO_SS = sum(shares_adj^2, na.rm = TRUE),
+    IO_TOTAL = sum(shares_adj, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    IOC_HHI = IO_SS / (IO_TOTAL^2)
+  ) %>%
+  select(permno, rdate, IOC_HHI)
+
+# ---- merge -------------------------------------------------------------------------------------
+io_rollup <- io_rollup %>%
+  left_join(io_hhi, by = c("permno", "rdate"))
+
+# ---- flag missing ------------------------------------------------------------------------------
+io_rollup <- io_rollup %>%
+  mutate(
+    IO_MISSING = (n_institutions == 0 | is.na(IOR) | is.na(TSO))
+  )
+
+# ---- save timeseries panel ---------------------------------------------------------------------
+saveRDS(io_rollup, "institutional_ownership_timeseries.rds")
+
+# ---- memory cleanup ----------------------------------------------------------------------------
+rm("io_hhi", "crsp_m")
+gc()
+
+#=================================================================================================
+# STEP 6: Create Target Panel (Top sample_n Deals with IO Data)
+# Input:  mergers, io_rollup
+# Output: target_panel
+#=================================================================================================
+
+# ---- Identify deals with IO data available -----------------------------------------------------
+
+deals_with_io <- mergers %>%
+ transmute(
+   master_deal_no,
+   target_permno = as.integer(sub(";.*$", "", target_permno)),
+   acquirer_permno = as.integer(sub(";.*$", "", acquirer_permno)),
+   dateann,
+   dateeff,
+   t_0,
+   t_m1,
+   t_end,
+   deal_value,
+   pct_cash, pct_stk, pct_other, pct_unknown
+ ) %>%
+ filter(
+   !is.na(target_permno),
+   !is.na(acquirer_permno)
+ ) %>%
+ # Check if target has IO data at t=-1 (critical for DiD baseline)
+ inner_join(
+   io_rollup %>%
+     filter(!is.na(IOR)) %>%
+     distinct(permno, rdate),
+   by = c("target_permno" = "permno", "t_m1" = "rdate")
+ ) %>%
+ # Take top sample_n by deal value
+ arrange(desc(deal_value)) %>%
+ slice_head(n = cfg$sample_n)
+
+# ---- Create target panel: merge deals with full IO timeseries ----------------------------------
+target_panel <- deals_with_io %>%
+ inner_join(
+   io_rollup,
+   by = c("target_permno" = "permno")
+ ) %>%
+ mutate(
+   firm_type = "target"
+ )
+
+#---- overlay event time grid --------------------------------------------------------------------
+target_panel <- target_panel %>%
+ mutate(
+   event_time = q_index(rdate) - q_index(t_0),
+
+   event_bucket = case_when(
+     event_time >= -4 & event_time <= -2 ~ "t_-4_to_-2",
+     event_time == -1 ~ "t_-1_baseline",
+     event_time == 0  ~ "t_0",
+     event_time >= 1 & event_time <= 2 ~ "t_1_to_2",
+     event_time >= 3 & event_time <= 4 ~ "t_3_to_4",
+     event_time < -4  ~ "pre_window",
+     event_time > 4   ~ "post_window",
+     TRUE ~ NA_character_
+   )
+ )
+
+target_panel <- target_panel %>%
+ filter(rdate <= t_end)  # Only keep quarters up to (but not after) completion
+
+saveRDS(target_panel, "target_panel.rds")
+
+# ---- memory cleanup ----------------------------------------------------------------------------
+rm("io_hhi", "crsp_m")
+gc()
+
+#=================================================================================================
+# STEP 7: Create Acquirer Panel (Matched Controls)
+# Input:  deals_with_io, io_rollup
+# Output: acquirer_panel
+#=================================================================================================
+
+acquirer_panel <- deals_with_io %>%
+ inner_join(
+   io_rollup,
+   by = c("acquirer_permno" = "permno")
+ ) %>%
+ mutate(
+   firm_type = "acquirer"
+ )
+
+# ---- Overlay event time grid (matched to target's deal announcement) --------------------------
+acquirer_panel <- acquirer_panel %>%
+ mutate(
+   event_time = q_index(rdate) - q_index(t_0),
+
+   event_bucket = case_when(
+    event_time >= -4 & event_time <= -2 ~ "t_-4_to_-2",
+    event_time == -1 ~ "t_-1_baseline",
+    event_time == 0  ~ "t_0",
+     event_time >= 1 & event_time <= 2 ~ "t_1_to_2",
+     event_time >= 3 & event_time <= 4 ~ "t_3_to_4",
+     event_time < -4  ~ "pre_window",
+     event_time > 4   ~ "post_window",
+     TRUE ~ NA_character_
+   )
+ ) %>%
+ filter(rdate <= t_end)  # Truncate at merger close (same as targets)
+
+saveRDS(acquirer_panel, "acquirer_panel.rds")
+
+#=================================================================================================
+# STEP 8: Match Controls
+# Input: target_panel, io_rollup
+# Output: control_permnos #=================================================================================================
+
+# ---- configuration -----------------------------------------------------------------------------
+CONTROL_TARGET_RATIO <- 2
+n_controls_target <- n_distinct(target_panel$target_permno) * CONTROL_TARGET_RATIO
+min_market_cap <- 500
+min_IO_threshold <- 0.60
+
+# ---- Step A: Pull Larger Candidate Pool with Tight Restrictions --------------------------------
+candidate_multiplier <- 5
+n_candidates <- n_controls_target * candidate_multiplier
+
+# ---- query with higher ME threshold ------------------------------------------------------------
+control_query_improved <- paste0(
+ "SELECT a.permno, ",
+ "       AVG(ABS(a.prc) * a.shrout) / 1000 as avg_me_millions ",
+ "FROM crsp.msf a ",
+ "INNER JOIN crsp.msenames b ",
+   "ON a.permno = b.permno ",
+   "AND a.date >= b.namedt ",
+   "AND a.date <= b.nameendt ",
+ "WHERE b.shrcd IN (10, 11) ",
+ exclude_clause, " ",
+ "AND a.date BETWEEN '", begdate, "' AND '", enddate, "' ",
+ "AND ABS(a.prc) * a.shrout > ", min_market_cap * 1000, " ",  # $500M threshold
+ "GROUP BY a.permno ",
+ "HAVING COUNT(*) >= 40 ",
+ "  AND AVG(ABS(a.prc) * a.shrout) / 1000 > ", min_market_cap, " ",  # Avg ME > $500M
+ "ORDER BY RANDOM() ",
+ "LIMIT ", n_candidates
+)
+
+candidate_permnos <- dbGetQuery(wrds, control_query_improved) %>%
+ pull(permno)
+
+# ---- Step B: Filter Candidates by IO Level -----------------------------------------------------
+candidate_chars <- io_rollup %>%
+ filter(permno %in% candidate_permnos) %>%
+ group_by(permno) %>%
+ summarise(
+   median_IOR = median(IOR, na.rm = TRUE),
+   median_ME = median(ME, na.rm = TRUE),
+   p25_IOR = quantile(IOR, 0.25, na.rm = TRUE),
+   n_quarters = n(),
+   .groups = "drop"
+ ) %>%
+ filter(
+   !is.na(median_IOR),
+   !is.na(median_ME),
+   n_quarters >= 20,
+   median_IOR >= min_IO_threshold,  # NEW: IO threshold
+   median_ME >= min_market_cap      # Verify ME filter
+ )
+
+# ---- Step C: Match Using Mahalanobis Distance --------------------------------------------------
+# ---- Get target characteristics ----------------------------------------------------------------
+target_chars <- target_panel %>%
+ filter(event_time == -1) %>%
+ summarise(
+   median_IOR = median(IOR, na.rm = TRUE),
+   mean_IOR = mean(IOR, na.rm = TRUE),
+   median_ME = median(ME, na.rm = TRUE),
+   mean_ME = mean(ME, na.rm = TRUE),
+   sd_ME = sd(ME, na.rm = TRUE)
+ )
+
+# ---- Standardize -------------------------------------------------------------------------------
+candidate_chars <- candidate_chars %>%
+ mutate(
+   IOR_std = (median_IOR - target_chars$mean_IOR) / sd(median_IOR, na.rm = TRUE),
+   ME_std = (log(median_ME) - log(target_chars$mean_ME)) /
+            sd(log(median_ME), na.rm = TRUE)
+ )
+
+# ---- Calculate distance (weight IO more heavily since it's the key concern) --------------------
+candidate_chars <- candidate_chars %>%
+ mutate(
+   distance = sqrt(2 * IOR_std^2 + ME_std^2)  # Weight IO 2x
+ )
+
+# ---- Select best matches -----------------------------------------------------------------------
+matched_controls <- candidate_chars %>%
+ arrange(distance) %>%
+ head(n_controls_target)
+
+control_permnos_matched <- matched_controls$permno
+
+# ---- Step D: balance Check ---------------------------------------------------------------------
+balance_table <- data.frame(
+ Group = c("Targets", "Controls (Matched)", "Difference"),
+ N = c(
+   n_distinct(target_panel$target_permno),
+   length(control_permnos_matched),
+   NA
+ ),
+ Median_IO = c(
+   target_chars$median_IOR * 100,
+   median(matched_controls$median_IOR, na.rm = TRUE) * 100,
+   (target_chars$median_IOR - median(matched_controls$median_IOR, na.rm = TRUE)) * 100
+ ),
+ Median_ME_B = c(
+   target_chars$median_ME / 1000,
+   median(matched_controls$median_ME, na.rm = TRUE) / 1000,
+   (target_chars$median_ME - median(matched_controls$median_ME, na.rm = TRUE)) / 1000
+ )
+)
+
+print(balance_table, digits = 2)
+
+# T-tests
+t_test_IO <- t.test(
+ target_panel$IOR[target_panel$event_time == -1],
+ matched_controls$median_IOR
+)
+
+t_test_ME <- t.test(
+ log(target_panel$ME[target_panel$event_time == -1]),
+ log(matched_controls$median_ME)
+)
+
+# ---- Standardized mean differences (SMD < 0.1 is good) -----------------------------------------
+smd_IO <- (target_chars$mean_IOR - mean(matched_controls$median_IOR)) /
+         sd(target_panel$IOR[target_panel$event_time == -1])
+smd_ME <- (log(target_chars$mean_ME) - mean(log(matched_controls$median_ME))) /
+         sd(log(target_panel$ME[target_panel$event_time == -1]))
+
+# ---- step E: Overlap Plot ----------------------------------------------------------------------
+
+overlap_data <- bind_rows(
+ target_panel %>%
+   filter(event_time == -1) %>%
+   transmute(IOR = IOR * 100, ME_log = log(ME), group = "Target"),
+ matched_controls %>%
+   transmute(IOR = median_IOR * 100, ME_log = log(median_ME), group = "Control")
+)
+
+p_overlap <- ggplot(overlap_data, aes(x = IOR, fill = group)) +
+ geom_density(alpha = 0.5) +
+ scale_fill_manual(values = c("Target" = "blue", "Control" = "darkgreen")) +
+ labs(
+   title = "Institutional Ownership Distribution",
+   subtitle = "Overlap between targets and matched controls",
+   x = "Institutional Ownership (%)",
+   y = "Density",
+   fill = "Group"
+ ) +
+ theme_minimal(base_size = 12) +
+ theme(plot.title = element_text(face = "bold"))
+
+print(p_overlap)
+
+# ---- Return matched control permnos ------------------------------------------------------------
+control_permnos <- control_permnos_matched
+
+#=================================================================================================
+# STEP 9: Create Control Panel (Non-Merger Firms)
+# Input:  control_permnos, io_rollup, target_panel
+# Output: control_panel
+#=================================================================================================
+
+# ---- Get date range from target panel ----------------------------------------------------------
+date_range <- target_panel %>%
+ summarise(
+   min_date = min(rdate, na.rm = TRUE),
+   max_date = max(rdate, na.rm = TRUE)
+ )
+
+# ---- Create control panel: all quarters for control firms --------------------------------------
+control_panel <- io_rollup %>%
+ filter(
+   permno %in% control_permnos,
+   rdate >= date_range$min_date,
+   rdate <= date_range$max_date
+ ) %>%
+ mutate(
+   firm_type = "control",
+   event_time = NA_integer_,
+   event_bucket = NA_character_,
+   master_deal_no = NA_character_,
+   target_permno = NA_integer_,
+   acquirer_permno = NA_integer_,
+   dateann = as.Date(NA),
+   dateeff = as.Date(NA),
+   t_0 = as.Date(NA),
+   t_m1 = as.Date(NA),
+   t_end = as.Date(NA),
+   deal_value = NA_real_,
+   pct_cash = NA_real_,
+   pct_stk = NA_real_,
+   pct_other = NA_real_,
+   pct_unknown = NA_real_
+ )
+
+saveRDS(control_panel, "control_panel.rds")
+
+# ---- clean up ----------------------------------------------------------------------------------
+rm("date_range", "candidate_permnos", "candidate_chars", "target_chars", "matched_controls",
+    "control_permnos_matched", "overlap_data")
+
+#=================================================================================================
+# STEP 10: Combine All Panels
+# Input: target_panel, acquirer_panel, control_panel
+# Output: full_panel, matched_panel
+#=================================================================================================
+
+# ---- Panel 1: Targets + Acquirers (matched DiD) ------------------------------------------------
+matched_panel <- bind_rows(
+ target_panel %>% mutate(treated = 1),
+ acquirer_panel %>% mutate(treated = 0)
+) %>%
+ arrange(master_deal_no, firm_type, rdate)
+
+# ---- Panel 2: Targets + Random Controls (traditional DiD) --------------------------------------
+full_panel <- bind_rows(
+ target_panel %>% mutate(treated = 1),
+ control_panel %>% mutate(treated = 0)
+) %>%
+ arrange(permno, rdate)
+
+# ---- Create post indicator ---------------------------------------------------------------------
+matched_panel <- matched_panel %>%
+ mutate(post = as.integer(event_time >= 0))
+
+full_panel <- full_panel %>%
+ mutate(post = as.integer(!is.na(event_time) & event_time >= 0))
+
+saveRDS(matched_panel, "matched_panel.rds")
+saveRDS(full_panel, "full_panel.rds")
+
+#=================================================================================================
+# STEP 11: EVENT STUDY: Institutional Ownership Levels (Targets Only)
+# Input: target_panel
+# Output: Table printed to terminal
+#=================================================================================================
+
+# ---- Prepare data ------------------------------------------------------------------------------
+event_study_data <- target_panel %>%
+  filter(event_time >= -4, event_time <= 4) %>%
+  transmute(
+    permno = target_permno,
+    rdate,
+    event_time,
+    IOR = IOR * 100,
+    ME
+  ) %>%
+  mutate(
+    pre_43 = as.integer(event_time >= -4 & event_time <= -3),
+    pre_2 = as.integer(event_time == -2),
+    post_0 = as.integer(event_time == 0),
+    post_12 = as.integer(event_time >= 1 & event_time <= 2),
+    post_34 = as.integer(event_time >= 3 & event_time <= 4),
+    et = as.integer(event_time),
+    post = as.integer(et >= 0),
+    log_ME = log(ME),
+    year = lubridate::year(rdate)
+  ) %>%
+  filter(!is.na(IOR))
+
+# ---- (1) Simple post ---------------------------------------------------------------------------
+es1 <- feols(IOR ~ post | permno + rdate, data = event_study_data, cluster = ~permno)
+
+# ---- (2) Binned --------------------------------------------------------------------------------
+es2 <- feols(IOR ~ pre_43 + pre_2 + post_0 + post_12 + post_34 | permno + rdate,
+             data = event_study_data, cluster = ~permno)
+
+# ---- (3) Binned with firm×year trends ----------------------------------------------------------
+es3 <- feols(IOR ~ pre_43 + pre_2 + post_0 + post_12 + post_34 | permno^year + rdate,
+             data = event_study_data, cluster = ~permno)
+
+# ---- (4) Linear trend break --------------------------------------------------------------------
+es4 <- feols(IOR ~ et + post + et:post | rdate,
+             data = event_study_data, cluster = ~permno)
+
+# ---- Print table -------------------------------------------------------------------------------
+modelsummary(
+  list("(1) Post" = es1, "(2) Binned" = es2, "(3) + Trends" = es3, "(4) Linear" = es4),
+  stars = c('***' = 0.01, '**' = 0.05, '*' = 0.1),
+  coef_rename = c(
+    "post" = "Post-announcement",
+    "pre_43" = "Pre: t=-4 to -3",
+    "pre_2" = "Pre: t=-2",
+    "post_0" = "Post: t=0",
+    "post_12" = "Post: t=1-2",
+    "post_34" = "Post: t=3-4",
+    "et" = "Trend (per qtr)",
+    "et:post" = "Post × Trend (break)"
+  ),
+  gof_map = c("nobs", "r.squared", "adj.r.squared"),
+  notes = c(
+    "Dependent variable: Institutional ownership ratio (%), 0-100 scale.",
+    "Reference period: t=-1 (quarter before announcement).",
+    "Cols (1)-(3): Firm and quarter FE. Col (3): + Firm×year trends. Col (4): Quarter FE only.",
+    "Standard errors clustered at firm level."
+  ),
+  output = "markdown"
+)
+
+# ---- appendix: Create quarter-to-quarter changes -------------------------------------------------
+test_data <- target_panel %>%
+  filter(event_time >= -4, event_time <= 4) %>%
+  arrange(target_permno, rdate) %>%
+  group_by(target_permno) %>%
+  mutate(
+    dIOR_qtq = (IOR - lag(IOR)) * 100,
+    pre_43 = as.integer(event_time >= -4 & event_time <= -3),
+    pre_2 = as.integer(event_time == -2),
+    post_0 = as.integer(event_time == 0),
+    post_12 = as.integer(event_time >= 1 & event_time <= 2),
+    post_34 = as.integer(event_time >= 3 & event_time <= 4)
+  ) %>%
+  ungroup() %>%
+  filter(!is.na(dIOR_qtq))
+
+test_model <- feols(
+  dIOR_qtq ~ pre_43 + pre_2 + post_0 + post_12 + post_34 | target_permno + rdate,
+  data = test_data,
+  cluster = ~target_permno
+)
+
+summary(test_model)
+
+# ---- Cash Deals Only ---------------------------------------------------------------------------
+
+# ---- Prepare data with payment filters ---------------------------------------------------------
+event_study_all <- target_panel %>%
+  filter(event_time >= -4, event_time <= 4) %>%
+  transmute(
+    permno = target_permno,
+    rdate, event_time,
+    IOR = IOR * 100,
+    ME,
+    pct_cash
+  ) %>%
+  mutate(
+    pre_43 = as.integer(event_time >= -4 & event_time <= -3),
+    pre_2 = as.integer(event_time == -2),
+    post_0 = as.integer(event_time == 0),
+    post_12 = as.integer(event_time >= 1 & event_time <= 2),
+    post_34 = as.integer(event_time >= 3 & event_time <= 4),
+    et = as.integer(event_time),
+    post = as.integer(et >= 0),
+    year = lubridate::year(rdate)
+  ) %>%
+  filter(!is.na(IOR))
+
+# ---- Filter to cash deals ----------------------------------------------------------------------
+event_study_cash75 <- event_study_all %>% filter(!is.na(pct_cash), pct_cash >= 75)
+event_study_cash90 <- event_study_all %>% filter(!is.na(pct_cash), pct_cash >= 90)
+
+# ---- Run models for each sample ----------------------------------------------------------------
+
+# ---- All deals ---------------------------------------------------------------------------------
+all_deals <- feols(
+  IOR ~ pre_43 + pre_2 + post_0 + post_12 + post_34 | permno + rdate,
+  data = event_study_all, cluster = ~permno
+)
+
+# ---- Cash ≥75% ---------------------------------------------------------------------------------
+cash75 <- feols(
+  IOR ~ pre_43 + pre_2 + post_0 + post_12 + post_34 | permno + rdate,
+  data = event_study_cash75, cluster = ~permno
+)
+
+# ---- Cash ≥90% ---------------------------------------------------------------------------------
+cash90 <- feols(
+  IOR ~ pre_43 + pre_2 + post_0 + post_12 + post_34 | permno + rdate,
+  data = event_study_cash90, cluster = ~permno
+)
+
+# ---- Print comparison table --------------------------------------------------------------------
+modelsummary(
+  list("(1) All Deals" = all_deals,
+       "(2) Cash ≥75%" = cash75,
+       "(3) Cash ≥90%" = cash90),
+  stars = c('***' = 0.01, '**' = 0.05, '*' = 0.1),
+  coef_rename = c(
+    "pre_43" = "Pre: t=-4 to -3",
+    "pre_2" = "Pre: t=-2",
+    "post_0" = "Post: t=0",
+    "post_12" = "Post: t=1-2",
+    "post_34" = "Post: t=3-4"
+  ),
+  gof_map = c("nobs", "r.squared"),
+  notes = c(
+    "Dependent variable: Institutional ownership ratio (%), 0-100 scale.",
+    "Reference period: t=-1. Firm and quarter FE. SEs clustered at firm level.",
+    "Column (1): All deals. Columns (2)-(3): Cash deals only (≥75% or ≥90% cash consideration)."
+  ),
+  output = "markdown"
+)
+
+# ---- Cash vs Non-Cash Difference ---------------------------------------------------------------
+
+# ---- Create pooled sample with cash indicator --------------------------------------------------
+pooled_data <- event_study_all %>%
+  filter(!is.na(pct_cash)) %>%
+  mutate(
+    is_cash75 = as.integer(pct_cash >= 75),
+    is_cash90 = as.integer(pct_cash >= 90),
+ 
+    # Interactions with post periods
+    cash75_post_0 = is_cash75 * post_0,
+    cash75_post_12 = is_cash75 * post_12,
+    cash75_post_34 = is_cash75 * post_34
+  )
+
+# ---- Test model: Cash interaction --------------------------------------------------------------
+test_cash <- feols(
+  IOR ~ pre_43 + pre_2 + post_0 + post_12 + post_34 +
+        cash75_post_0 + cash75_post_12 + cash75_post_34 |
+        permno + rdate,
+  data = pooled_data,
+  cluster = ~permno
+)
+
+# ---- Extract results ---------------------------------------------------------------------------
+diff_t0 <- coef(test_cash)["cash75_post_0"]
+se_t0 <- se(test_cash)["cash75_post_0"]
+t_stat_t0 <- diff_t0 / se_t0
+p_val_t0 <- 2 * pt(-abs(t_stat_t0), df = test_cash$nobs)
+
+diff_t12 <- coef(test_cash)["cash75_post_12"]
+se_t12 <- se(test_cash)["cash75_post_12"]
+
+diff_t34 <- coef(test_cash)["cash75_post_34"]
+se_t34 <- se(test_cash)["cash75_post_34"]
+
+# ---- Print full comparison ---------------------------------------------------------------------
+summary(test_cash)
+
+# ---- Recreate event_study_all with pct_stk -----------------------------------------------------
+event_study_all <- target_panel %>%
+  filter(event_time >= -4, event_time <= 4) %>%
+  transmute(
+    permno = target_permno,
+    rdate, event_time,
+    IOR = IOR * 100,
+    ME,
+    pct_cash,
+    pct_stk
+  ) %>%
+  mutate(
+    pre_43 = as.integer(event_time >= -4 & event_time <= -3),
+    pre_2 = as.integer(event_time == -2),
+    post_0 = as.integer(event_time == 0),
+    post_12 = as.integer(event_time >= 1 & event_time <= 2),
+    post_34 = as.integer(event_time >= 3 & event_time <= 4),
+    et = as.integer(event_time),
+    post = as.integer(et >= 0),
+    year = lubridate::year(rdate)
+  ) %>%
+  filter(!is.na(IOR))
+
+# ---- run stock deal filters --------------------------------------------------------------------
+event_study_stock75 <- event_study_all %>% filter(!is.na(pct_stk), pct_stk >= 75)
+event_study_stock90 <- event_study_all %>% filter(!is.na(pct_stk), pct_stk >= 90)
+
+# ---- Estimate models ---------------------------------------------------------------------------
+stock75 <- feols(IOR ~ pre_43 + pre_2 + post_0 + post_12 + post_34 | permno + rdate,
+                 data = event_study_stock75, cluster = ~permno)
+
+stock90 <- feols(IOR ~ pre_43 + pre_2 + post_0 + post_12 + post_34 | permno + rdate,
+                 data = event_study_stock90, cluster = ~permno)
+
+# ---- Print -------------------------------------------------------------------------------------
+modelsummary(
+  list("(1) All Deals" = all_deals, "(2) Stock ≥75%" = stock75, "(3) Stock ≥90%" = stock90),
+  stars = c('***' = 0.01, '**' = 0.05, '*' = 0.1),
+  coef_rename = c("pre_43" = "Pre: t=-4 to -3", "pre_2" = "Pre: t=-2",
+                  "post_0" = "Post: t=0", "post_12" = "Post: t=1-2", "post_34" = "Post: t=3-4"),
+  gof_map = c("nobs", "r.squared"),
+  output = "markdown"
+)
+
+#---- structural break analysis ------------------------------------------------------------------
+panel_analysis <- matched_panel %>%
+  filter(event_time >= -4, event_time <= 4) %>%
+  mutate(
+    firm_permno = if_else(firm_type == "target", target_permno, acquirer_permno),
+    treated = as.integer(firm_type == "target"),
+    et = as.integer(event_time),
+    
+    # simple specification
+    post = as.integer(et >= 0),
+    
+    # For trend break, use et and et×post interaction
+    et_post_interact = et * post,
+    
+    # Baseline
+    IOR_baseline = IOR[event_time == -1][1],
+    dIOR = (IOR - IOR_baseline) * 100
+  ) %>%
+  group_by(master_deal_no, firm_permno) %>%
+  mutate(IOR_baseline = first(na.omit(IOR_baseline))) %>%
+  ungroup() %>%
+  filter(!is.na(IOR_baseline), !is.na(dIOR))
+
+# ---- target firms ------------------------------------------------------------------------------
+panel_tgt <- panel_analysis %>% filter(treated == 1)
+
+# (1A) Level shift only (baseline)
+tgt_1a <- feols(
+  dIOR ~ post | firm_permno + rdate,
+  data = panel_tgt,
+  cluster = ~master_deal_no
+)
+
+# ---- (1B) trend break without collinearity -----------------------------------------------------
+# This estimates: α + β₁·t + β₂·Post + β₃·(t×Post)
+tgt_1b <- feols(
+  dIOR ~ et + post + et:post | rdate,  # Remove firm FE to avoid collinearity
+  data = panel_tgt,
+  cluster = ~master_deal_no
+)
+
+# ---- (1C) With firm FE but only post interaction -----------------------------------------------
+tgt_1c <- feols(
+  dIOR ~ post + et:post | firm_permno + rdate,
+  data = panel_tgt,
+  cluster = ~master_deal_no
+)
+
+# ---- (1D) Binned (most stable with firm FE) ----------------------------------------------------
+panel_tgt <- panel_tgt %>%
+  mutate(
+    t_m4 = as.integer(et == -4),
+    t_m3 = as.integer(et == -3),
+    t_m2 = as.integer(et == -2),
+    # t_m1 = baseline (omitted)
+    t_0 = as.integer(et == 0),
+    t_1 = as.integer(et == 1),
+    t_2 = as.integer(et == 2),
+    t_3 = as.integer(et == 3),
+    t_4 = as.integer(et == 4)
+  )
+
+tgt_1d <- feols(
+  dIOR ~ i(et, ref = -1) | firm_permno + rdate,
+  data = panel_tgt,
+  cluster = ~master_deal_no
+)
+
+# ---- (1E) i() syntax (equivalent to 1d, cleaner) -----------------------------------------------
+tgt_1e <- feols(
+  dIOR ~ i(et, ref = -1) | firm_permno + rdate,
+  data = panel_tgt,
+  cluster = ~master_deal_no
+)
+
+# ---- Print results -----------------------------------------------------------------------------
+modelsummary(
+  list(
+    "(1A) Level" = tgt_1a,
+    "(1B) Trend\nBreak" = tgt_1b,
+    "(1C) Post×Trend\n(with FE)" = tgt_1c,
+    "(1D) Saturated" = tgt_1d
+  ),
+  stars = c('***' = 0.01, '**' = 0.05, '*' = 0.1),
+  coef_rename = c(
+    "post" = "Post (level shift)",
+    "et" = "Trend (per qtr)",
+    "et:post" = "Post × Trend (break)",
+    "t_m4" = "t = -4",
+    "t_m3" = "t = -3",
+    "t_m2" = "t = -2",
+    "t_0" = "t = 0",
+    "t_1" = "t = 1",
+    "t_2" = "t = 2",
+    "t_3" = "t = 3",
+    "t_4" = "t = 4"
+  ),
+  gof_map = c("nobs", "r.squared"),
+  output = "markdown"
+)
+
+# ---- Test if break is significant --------------------------------------------------------------
+trend_break_t <- coef(tgt_1b)["et:post"] / se(tgt_1b)["et:post"]
+trend_break_p <- 2 * (1 - pt(abs(trend_break_t), df = tgt_1b$nobs - length(coef(tgt_1b))))
+
+#=================================================================================================
+# STEP 12: Institutional Flow Decomposition (Entrants, Exiters, Stayers)
+# Input:  institutional_holdings_granular, target_panel
+# Output: Flow decomposition analysis
+#=================================================================================================
+
+# ---- Prepare deal-level data -------------------------------------------------------------------
+
+deals_flow <- target_panel %>%
+  filter(event_time %in% c(-1, 0)) %>%
+  group_by(master_deal_no, target_permno) %>%
+  summarise(
+    t_m1 = rdate[event_time == -1][1],
+    t_0 = rdate[event_time == 0][1],
+    TSO_tm1 = TSO[event_time == -1][1],
+    IOR_tm1 = IOR[event_time == -1][1],
+    IOR_t0 = IOR[event_time == 0][1],
+    deal_value = deal_value[1],
+    pct_cash = pct_cash[1],
+    pct_stk = pct_stk[1],
+    .groups = "drop"
+  ) %>%
+  filter(!is.na(t_m1), !is.na(t_0), !is.na(TSO_tm1)) %>%
+  mutate(
+    target_permno = as.integer(target_permno),
+    master_deal_no = as.character(master_deal_no)
+  )
+
+# ---- Get holdings ------------------------------------------------------------------------------
+
+holdings_tm1 <- institutional_holdings_granular %>%
+  inner_join(
+    deals_flow %>% select(master_deal_no, target_permno, t_m1),
+    by = c("permno" = "target_permno", "rdate" = "t_m1")
+  ) %>%
+  filter(shares_adj > 0) %>%
+  transmute(master_deal_no, permno, mgrno, shares_tm1 = shares_adj)
+
+holdings_t0 <- institutional_holdings_granular %>%
+  inner_join(
+    deals_flow %>% select(master_deal_no, target_permno, t_0),
+    by = c("permno" = "target_permno", "rdate" = "t_0")
+  ) %>%
+  filter(shares_adj > 0) %>%
+  transmute(master_deal_no, permno, mgrno, shares_t0 = shares_adj)
+
+# ---- Classify (institution-level) -------------------------------------------------------------
+
+flow_panel <- full_join(
+  holdings_tm1,
+  holdings_t0,
+  by = c("master_deal_no", "permno", "mgrno")
+) %>%
+  mutate(
+    shares_tm1 = coalesce(shares_tm1, 0),
+    shares_t0  = coalesce(shares_t0, 0),
+
+    Entrant = as.integer(shares_tm1 == 0 & shares_t0 > 0),
+    Exiter  = as.integer(shares_tm1 > 0 & shares_t0 == 0),
+    Stayer  = as.integer(shares_tm1 > 0 & shares_t0 > 0),
+
+    shares_change = shares_t0 - shares_tm1
+  ) %>%
+  left_join(deals_flow, by = c("master_deal_no", "permno" = "target_permno"))
+
+# ---- Aggregate to deal×firm (deal-level) -------------------------------------------------------
+
+deals_panel <- flow_panel %>%
+  group_by(master_deal_no, permno) %>%
+  summarise(
+    n_entrants = sum(Entrant, na.rm = TRUE),
+    n_exiters  = sum(Exiter,  na.rm = TRUE),
+    n_stayers  = sum(Stayer,  na.rm = TRUE),
+
+    shares_entry         = sum(shares_t0  * Entrant, na.rm = TRUE),
+    shares_exit          = sum(shares_tm1 * Exiter,  na.rm = TRUE),
+    shares_stayer_change = sum(shares_change * Stayer, na.rm = TRUE),
+
+    t_m1      = dplyr::first(t_m1),
+    t_0       = dplyr::first(t_0),
+    TSO_tm1   = dplyr::first(TSO_tm1),
+    IOR_tm1   = dplyr::first(IOR_tm1),
+    IOR_t0    = dplyr::first(IOR_t0),
+    deal_value = dplyr::first(deal_value),
+    pct_cash   = dplyr::first(pct_cash),
+    pct_stk    = dplyr::first(pct_stk),
+
+    .groups = "drop"
+  ) %>%
+  filter(!is.na(TSO_tm1), TSO_tm1 > 0) %>%
+  mutate(
+    entry_pct = (shares_entry / TSO_tm1) * 100,
+    exit_pct  = (shares_exit  / TSO_tm1) * 100,
+    stayer_change_pct = (shares_stayer_change / TSO_tm1) * 100,
+
+    net_change_pct = entry_pct - exit_pct + stayer_change_pct,
+    actual_IOR_change = (IOR_t0 - IOR_tm1) * 100,
+
+    deal_type = case_when(
+      !is.na(pct_cash) & pct_cash >= 90 ~ "Cash",
+      !is.na(pct_stk)  & pct_stk  >= 90 ~ "Stock",
+      TRUE ~ "Mixed"
+    )
+  )
+
+# ---- Results -----------------------------------------------------------------------------------
+
+cat("Overall Statistics:\n")
+cat(sprintf("  Mean exit flow:       %.2f%% of TSO\n", mean(deals_panel$exit_pct)))
+cat(sprintf("  Mean entry flow:      %.2f%% of TSO\n", mean(deals_panel$entry_pct)))
+cat(sprintf("  Mean stayer change:   %.2f%% of TSO\n", mean(deals_panel$stayer_change_pct)))
+cat(sprintf("  Net change (decomp):  %.2f pp\n", mean(deals_panel$net_change_pct)))
+cat(sprintf("  Actual IOR change:    %.2f pp (verification)\n\n", mean(deals_panel$actual_IOR_change)))
+
+# ---- Tests -------------------------------------------------------------------------------------
+t_exit <- t.test(deals_panel$exit_pct)
+t_entry <- t.test(deals_panel$entry_pct)
+t_net <- t.test(deals_panel$net_change_pct)
+
+cat("Statistical Tests:\n")
+cat(sprintf("  Exit > 0:  t=%.2f, p=%.4f %s\n", t_exit$statistic, t_exit$p.value,
+            ifelse(t_exit$p.value < 0.01, "***", "")))
+cat(sprintf("  Entry > 0: t=%.2f, p=%.4f %s\n", t_entry$statistic, t_entry$p.value,
+            ifelse(t_entry$p.value < 0.01, "***", "")))
+cat(sprintf("  Net ≠ 0:   t=%.2f, p=%.4f %s\n\n", t_net$statistic, t_net$p.value,
+            ifelse(t_net$p.value < 0.01, "***", "")))
+
+# ---- Cash vs Stock -----------------------------------------------------------------------------
+by_type <- deals_panel %>%
+  filter(deal_type %in% c("Cash", "Stock")) %>%
+  group_by(deal_type) %>%
+  summarise(across(c(entry_pct, exit_pct, net_change_pct),
+                   list(mean = mean, sd = sd, n = ~n())))
+
+print(by_type, width = Inf)
+
+# ---- clean up ----------------------------------------------------------------------------------
+rm("deals_flow", "holdings_tm1", "holdings_t0")
+
+#=================================================================================================
+# STEP 13: Electorate Replacement Analysis (Top Holders)
+# Input:  institutional_holdings_granular, target_panel
+# Output: Jaccard & Cosine replacement for top-K holders
+#=================================================================================================
+
+# ---- Helper functions --------------------------------------------------------------------------
+jaccard_similarity <- function(set_a, set_b) {
+  if (length(set_a) == 0 || length(set_b) == 0) return(NA_real_)
+  intersection <- length(intersect(set_a, set_b))
+  union <- length(union(set_a, set_b))
+  if (union == 0) return(NA_real_)
+  intersection / union
+}
+
+cosine_similarity <- function(weights_a, weights_b, ids_a, ids_b) {
+  all_ids <- union(ids_a, ids_b)
+  if (length(all_ids) == 0) return(NA_real_)
+ 
+  vec_a <- sapply(all_ids, function(id) {
+    idx <- which(ids_a == id)
+    if (length(idx) > 0) weights_a[idx[1]] else 0
+  })
+ 
+  vec_b <- sapply(all_ids, function(id) {
+    idx <- which(ids_b == id)
+    if (length(idx) > 0) weights_b[idx[1]] else 0
+  })
+ 
+  dot_product <- sum(vec_a * vec_b)
+  norm_a <- sqrt(sum(vec_a^2))
+  norm_b <- sqrt(sum(vec_b^2))
+ 
+  if (norm_a == 0 || norm_b == 0) return(NA_real_)
+  dot_product / (norm_a * norm_b)
+}
+
+compute_hhi <- function(shares) {
+  if (length(shares) == 0 || sum(shares) == 0) return(NA_real_)
+  share_fracs <- shares / sum(shares)
+  sum(share_fracs^2) * 10000
+}
+
+# ---- Prepare data ------------------------------------------------------------------------------
+quarters_needed <- target_panel %>%
+  filter(event_time %in% c(-2, -1, 0)) %>%
+  transmute(
+    master_deal_no = as.character(master_deal_no),
+    target_permno = as.integer(target_permno),
+    event_time, rdate, deal_value, pct_cash, pct_stk
+  ) %>%
+  distinct()
+
+holdings_multi <- institutional_holdings_granular %>%
+  inner_join(quarters_needed, by = c("permno" = "target_permno", "rdate")) %>%
+  filter(shares_adj > 0) %>%
+  transmute(master_deal_no, permno, event_time, mgrno, shares = shares_adj,
+            deal_value, pct_cash, pct_stk)
+
+# ---- Function to get top-K metrics -------------------------------------------------------------
+calculate_replacement <- function(holdings_df, periods, k) {
+ 
+  # Get top-K at each period
+  topk_all <- holdings_df %>%
+    filter(event_time %in% periods) %>%
+    group_by(master_deal_no, permno, event_time) %>%
+    arrange(desc(shares)) %>%
+    slice_head(n = k) %>%
+    mutate(
+      total_topk_shares = sum(shares),
+      share_weight = shares / total_topk_shares
+    ) %>%
+    ungroup()
+ 
+  # Split by period
+  period_a <- periods[1]
+  period_b <- periods[2]
+ 
+  topk_a <- topk_all %>% filter(event_time == period_a)
+  topk_b <- topk_all %>% filter(event_time == period_b)
+ 
+  # Calculate for each deal
+  deals_unique <- topk_a %>% distinct(master_deal_no, permno, deal_value, pct_cash, pct_stk)
+ 
+  deals_unique %>%
+    mutate(
+      jaccard_repl = map2_dbl(master_deal_no, permno, ~{
+        mgrs_a <- topk_a %>% filter(master_deal_no == .x, permno == .y) %>% pull(mgrno)
+        mgrs_b <- topk_b %>% filter(master_deal_no == .x, permno == .y) %>% pull(mgrno)
+        if (length(mgrs_a) == 0 | length(mgrs_b) == 0) return(NA_real_)
+        1 - jaccard_similarity(mgrs_a, mgrs_b)
+      }),
+ 
+      cosine_repl = map2_dbl(master_deal_no, permno, ~{
+        data_a <- topk_a %>% filter(master_deal_no == .x, permno == .y)
+        data_b <- topk_b %>% filter(master_deal_no == .x, permno == .y)
+        if (nrow(data_a) == 0 | nrow(data_b) == 0) return(NA_real_)
+        1 - cosine_similarity(data_a$share_weight, data_b$share_weight,
+                             data_a$mgrno, data_b$mgrno)
+      }),
+ 
+      hhi_a = map2_dbl(master_deal_no, permno, ~{
+        shares <- topk_a %>% filter(master_deal_no == .x, permno == .y) %>% pull(shares)
+        compute_hhi(shares)
+      }),
+ 
+      hhi_b = map2_dbl(master_deal_no, permno, ~{
+        shares <- topk_b %>% filter(master_deal_no == .x, permno == .y) %>% pull(shares)
+        compute_hhi(shares)
+      }),
+ 
+      delta_hhi = hhi_b - hhi_a,
+ 
+      deal_type = case_when(
+        !is.na(pct_cash) & pct_cash >= 90 ~ "Cash",
+        !is.na(pct_stk) & pct_stk >= 90 ~ "Stock",
+        TRUE ~ "Mixed"
+      )
+    )
+}
+
+# ---- Panel A: Treatment (t=-1 to t=0) ----------------------------------------------------------
+panel_a <- map_dfr(c(5, 10, 20), ~{
+  res <- calculate_replacement(holdings_multi, c(-1, 0), .x)
+  res %>%
+    summarise(
+      K = .x,
+      Mean_Jaccard = mean(jaccard_repl, na.rm = TRUE) * 100,
+      Mean_Cosine = mean(cosine_repl, na.rm = TRUE) * 100,
+      Mean_ΔHHI = mean(delta_hhi, na.rm = TRUE)
+    )
+})
+
+# ---- Panel B: Placebo (t=-2 to t=-1) -----------------------------------------------------------
+panel_b <- map_dfr(c(5, 10, 20), ~{
+  res <- calculate_replacement(holdings_multi, c(-2, -1), .x)
+  res %>%
+    summarise(
+      K = .x,
+      Mean_Jaccard = mean(jaccard_repl, na.rm = TRUE) * 100,
+      Mean_Cosine = mean(cosine_repl, na.rm = TRUE) * 100,
+      Mean_ΔHHI = mean(delta_hhi, na.rm = TRUE)
+    )
+})
+
+# ---- Combined table ----------------------------------------------------------------------------
+combined <- bind_rows(
+  panel_a %>% mutate(Period = "Treatment (t=-1→0)"),
+  panel_b %>% mutate(Period = "Placebo (t=-2→-1)")
+) %>%
+  select(Period, K, Mean_Jaccard, Mean_Cosine, Mean_ΔHHI)
+
+print(combined, digits = 2)
+
+# ---- DiD test ----------------------------------------------------------------------------------
+did_test <- tibble(
+  K = c(5, 10, 20),
+  DiD_Jaccard = panel_a$Mean_Jaccard - panel_b$Mean_Jaccard,
+  DiD_Cosine = panel_a$Mean_Cosine - panel_b$Mean_Cosine
+)
+
+print(did_test, digits = 2)
+
+# ---- clean up ---------------------------------------------------------------------------------
+rm("quarters_needed")
+gc()
+
+#=================================================================================================
+# STEP 14: Arbitrageur Validation - Entry Pattern Analysis
+# Input:  flow_panel, institutional_holdings_granular, target_panel, mergers
+# Output: Institution-level entry intensity metrics
+#=================================================================================================
+
+# ---- Get entrants with their positions ---------------------------------------------------------
+entrants_with_volume <- flow_panel %>%
+  filter(Entrant == 1) %>%
+  mutate(
+    deal_type = case_when(
+      !is.na(pct_cash) & pct_cash >= 75 ~ "Cash",
+      !is.na(pct_stk)  & pct_stk  >= 75 ~ "Stock",
+      TRUE ~ "Mixed"
+    )
+  ) %>%
+  select(mgrno, master_deal_no, permno, shares_t0, deal_type)
+
+# ---- Institution-level metrics -------------------------------------------------------------------
+institution_metrics <- entrants_with_volume %>%
+  group_by(mgrno) %>%
+  summarise(
+    n_entries = n(),
+    total_shares_entered = sum(shares_t0, na.rm = TRUE),
+    avg_position_size = mean(shares_t0, na.rm = TRUE),
+    n_cash = sum(deal_type == "Cash", na.rm = TRUE),
+    pct_cash_entries = n_cash / n_entries,
+    .groups = "drop"
+  )
+
+# ---- Add breadth ---------------------------------------------------------------------------------
+inst_breadth <- institutional_holdings_granular %>%
+  group_by(mgrno) %>%
+  summarise(n_firms_held = n_distinct(permno), .groups = "drop")
+
+institution_metrics <- institution_metrics %>%
+  left_join(inst_breadth, by = "mgrno") %>%
+  filter(n_entries >= 3)  # Min 3 entries
+
+# ---- Distribution ---------------------------------------------------------------------------------
+entry_dist <- institution_metrics %>%
+  mutate(
+    entry_bucket = case_when(
+      n_entries <= 5 ~ "3-5",
+      n_entries <= 10 ~ "6-10",
+      n_entries <= 20 ~ "11-20",
+      n_entries <= 50 ~ "21-50",
+      TRUE ~ "51+"
+    ),
+    entry_bucket = factor(entry_bucket, levels = c("3-5", "6-10", "11-20", "21-50", "51+"))
+  ) %>%
+  group_by(entry_bucket) %>%
+  summarise(
+    N_institutions = n(),
+    Pct_institutions = n() / nrow(institution_metrics) * 100,
+    Total_entries = sum(n_entries),
+    Total_volume = sum(total_shares_entered),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    Pct_entries = Total_entries / sum(Total_entries) * 100,
+    Pct_volume = Total_volume / sum(Total_volume) * 100
+  )
+
+print(entry_dist, digits = 2)
+
+# Top percentiles
+institution_metrics_sorted <- institution_metrics %>%
+  arrange(desc(n_entries)) %>%
+  mutate(
+    rank_pct = row_number() / n(),
+    cum_entries = cumsum(n_entries) / sum(n_entries),
+    cum_volume = cumsum(total_shares_entered) / sum(total_shares_entered)
+  )
+
+top_10 <- institution_metrics_sorted %>% filter(rank_pct <= 0.10) %>% tail(1)
+top_5 <- institution_metrics_sorted %>% filter(rank_pct <= 0.05) %>% tail(1)
+top_1 <- institution_metrics_sorted %>% filter(rank_pct <= 0.01) %>% tail(1)
+
+cat(sprintf("Top 10%% of entrants account for:\n"))
+cat(sprintf("  %.1f%% of entry events\n", top_10$cum_entries * 100))
+cat(sprintf("  %.1f%% of entry volume (shares)\n\n", top_10$cum_volume * 100))
+
+cat(sprintf("Top 5%% of entrants account for:\n"))
+cat(sprintf("  %.1f%% of entry events\n", top_5$cum_entries * 100))
+cat(sprintf("  %.1f%% of entry volume (shares)\n\n", top_5$cum_volume * 100))
+
+cat(sprintf("Top 1%% of entrants account for:\n"))
+cat(sprintf("  %.1f%% of entry events\n", top_1$cum_entries * 100))
+cat(sprintf("  %.1f%% of entry volume (shares)\n\n", top_1$cum_volume * 100))
+
+# Classify
+institution_metrics <- institution_metrics %>%
+  arrange(desc(n_entries)) %>%
+  mutate(
+    rank = row_number(),
+    rank_pct = rank / n(),
+    arb_class = case_when(
+      rank_pct <= 0.01 ~ "Top 1% (Elite Arbs)",
+      rank_pct <= 0.05 ~ "Top 5% (Professional Arbs)",
+      rank_pct <= 0.10 ~ "Top 10% (Active Arbs)",
+      rank_pct <= 0.25 ~ "Top 25% (Regular Arbs)",
+      TRUE ~ "Occasional Entrants"
+    )
+ )
+
+# Comparison
+final_comp <- institution_metrics %>%
+  group_by(arb_class) %>%
+  summarise(
+    N = n(),
+    Mean_Entries = mean(n_entries),
+    Pct_Cash = mean(pct_cash_entries, na.rm = TRUE) * 100,
+    Pct_Entry_Events = sum(n_entries) / sum(institution_metrics$n_entries) * 100,
+    Pct_Entry_Volume = sum(total_shares_entered) / sum(institution_metrics$total_shares_entered) * 100,
+    .groups = "drop"
+  )
+
+print(final_comp, digits = 2)
+
+saveRDS(institution_metrics, "institution_arb_classification_final.rds")
+
+# ---- Calculate Gini coefficient for entry concentration ----------------------------------------
+calculate_gini <- function(x) {
+  x <- x[!is.na(x) & x > 0]
+  x <- sort(x)
+  n <- length(x)
+  if (n == 0) return(NA_real_)
+ 
+  # Gini = (2 * sum(i * x_i) / (n * sum(x))) - (n+1)/n
+  gini <- (2 * sum((1:n) * x) / (n * sum(x))) - (n + 1) / n
+  return(gini)
+}
+
+# ---- Gini for entry counts and volume -----------------------------------------------------------
+gini_entries <- calculate_gini(institution_metrics$n_entries)
+gini_volume <- calculate_gini(institution_metrics$total_shares_entered)
+
+cat("\n\nCONCENTRATION (GINI COEFFICIENTS):\n")
+cat(strrep("=", 60), "\n")
+cat(sprintf("Entry events (# deals):  %.3f\n", gini_entries))
+cat(sprintf("Entry volume (shares):   %.3f\n\n", gini_volume))
+
+# ---- clean up ----------------------------------------------------------------------------------
+rm("entrants_with_volume", "inst_breadth")
+
+#=================================================================================================
+# STEP 15: Velocity Analysis - Institutional Trading Speed
+# Input:  deals_panel, deals_with_io, target_panel
+# Output: Daily velocity estimates, model selection, predictions at key horizons
+#=================================================================================================
+
+# ---- data structure analysis -------------------------------------------------------------------
+timing_data <- deal_flows %>%
+  left_join(
+    deals_with_io %>% select(master_deal_no, target_permno, dateann),
+    by = c("master_deal_no", "permno" = "target_permno")
+  ) %>%
+  filter(!is.na(dateann), !is.na(t_0)) %>%
+  mutate(
+    days_to_qtr_end = as.numeric(t_0 - dateann)
+  ) %>%
+  filter(days_to_qtr_end >= 1, days_to_qtr_end <= 90)
+
+# ---- decomposition ------------------------------------------------------------------------------
+weekly_flows_cash <- timing_data %>%
+  filter(grepl("Cash", deal_type, ignore.case = TRUE)) %>%  # Flexible matching
+  mutate(week = floor(days_to_qtr_end / 7) + 1) %>%
+  group_by(week) %>%
+  summarise(
+    N = n(),
+    Days_Mid = mean(days_to_qtr_end),
+    Exit = mean(exit_pct),
+    Entry = mean(entry_pct),
+    Net = mean(net_change_pct),
+    Stayer = Net - Entry + Exit,
+    .groups = "drop"
+  )
+
+print(weekly_flows_cash, digits = 1)
+
+# ---- Three-bucket decomposition (all deal types) -------------------------------------------------
+coarse_decomp <- timing_data %>%
+  mutate(
+    bucket = case_when(
+      days_to_qtr_end <= 30 ~ "Early (1-30d)",
+      days_to_qtr_end <= 60 ~ "Middle (31-60d)",
+      TRUE ~ "Late (61-90d)"
+    ),
+    bucket = factor(bucket, levels = c("Early (1-30d)", "Middle (31-60d)", "Late (61-90d)"))
+  ) %>%
+  group_by(deal_type, bucket) %>%
+  summarise(
+    N = n(),
+    Mean_Days = mean(days_to_qtr_end),
+    
+    # COMPONENTS (% of TSO)
+    Exit_Mean = mean(exit_pct),
+    Exit_Median = median(exit_pct),
+    Entry_Mean = mean(entry_pct),
+    Entry_Median = median(entry_pct),
+    Stayer_Mean = mean(net_change_pct) - mean(entry_pct) + mean(exit_pct),
+    
+    # NET CHANGE (pp)
+    Net_Mean = mean(net_change_pct),
+    Net_Median = median(net_change_pct),
+    
+    # GROSS ACTIVITY
+    Gross_Turnover = abs(Exit_Mean) + abs(Entry_Mean) + abs(Stayer_Mean),
+    
+    .groups = "drop"
+  )
+
+print(coarse_decomp, digits = 1, width = Inf)
+
+# ---- Cash only ----------------------------------------------------------------------------------
+cash_coarse <- coarse_decomp %>% 
+  filter(deal_type == "Cash") %>%
+  select(bucket, N, Mean_Days, Exit_Mean, Entry_Mean, Stayer_Mean, Net_Mean, Gross_Turnover)
+
+print(cash_coarse, digits = 1, width = Inf)
+
+# ---- Test differences ---------------------------------------------------------------------------
+early_cash <- timing_data %>% filter(deal_type == "Cash", days_to_qtr_end <= 30)
+middle_cash <- timing_data %>% filter(deal_type == "Cash", days_to_qtr_end > 30, days_to_qtr_end <= 60)
+late_cash <- timing_data %>% filter(deal_type == "Cash", days_to_qtr_end > 60)
+
+# Test if middle differs from early
+t_exit <- t.test(middle_cash$exit_pct, early_cash$exit_pct)
+t_net <- t.test(middle_cash$net_change_pct, early_cash$net_change_pct)
+
+cat("Middle vs Early:\n")
+cat(sprintf("  Exit difference: %.1f pp (p=%.3f) %s\n",
+            mean(middle_cash$exit_pct) - mean(early_cash$exit_pct),
+            t_exit$p.value,
+            ifelse(t_exit$p.value < 0.05, "**", "")))
+cat(sprintf("  Net difference:  %.1f pp (p=%.3f) %s\n\n",
+            mean(middle_cash$net_change_pct) - mean(early_cash$net_change_pct),
+            t_net$p.value,
+            ifelse(t_net$p.value < 0.05, "**", "")))
+
+# Test if late differs from middle
+t_exit_late <- t.test(late_cash$exit_pct, middle_cash$exit_pct)
+t_net_late <- t.test(late_cash$net_change_pct, middle_cash$net_change_pct)
+
+cat("Late vs Middle:\n")
+cat(sprintf("  Exit difference: %.1f pp (p=%.3f) %s\n",
+            mean(late_cash$exit_pct) - mean(middle_cash$exit_pct),
+            t_exit_late$p.value,
+            ifelse(t_exit_late$p.value < 0.05, "**", "")))
+cat(sprintf("  Net difference:  %.1f pp (p=%.3f) %s\n\n",
+            mean(late_cash$net_change_pct) - mean(middle_cash$net_change_pct),
+            t_net_late$p.value,
+            ifelse(t_net_late$p.value < 0.05, "**", "")))
+
+# PHASE 1: Early (Days 1-30, N=119)
+#  Exit:   13.1%  ← Baseline institutional departure
+#  Entry:  19.5%  ← Initial arb entry
+#  Stayer: -8.3%  ← Moderate trimming
+#  Net:    -1.9pp ← Small net effect
+#  Gross:  40.9%  ← Substantial churn
+
+# PHASE 2: Middle (Days 31-60, N=118)  [PEAK ACTIVITY]
+#  Exit:   18.5%  ← +5.4pp jump (p<0.001) ***
+#  Entry:  23.0%  ← Rising (arbs continue entering)
+#  Stayer: -8.7%  ← Stable trimming
+#  Net:    -4.2pp ← 2.2x worse than early (p=0.085) *
+#  Gross:  50.2%  ← Peak turnover
+
+# PHASE 3: Late (Days 61-90, N=73)  [STABILIZATION]
+#  Exit:   18.2%  ← Plateau (no diff from middle, p=0.89)
+#  Entry:  24.3%  ← Still rising (late arbs)
+#  Stayer: -9.5%  ← Continuing trimming
+#  Net:    -3.4pp ← Similar to middle (p=0.56)
+#  Gross:  52.0%  ← Sustained high turnover
+
+# Table: Institutional Trading Phases Around Merger Announcements (Cash Deals)
+
+# Phase                N      Exit    Entry   Stayer   Net      Gross
+#                    Deals    (%)     (%)     Trim(%)  (pp)   Turnover
+# ─────────────────────────────────────────────────────────────────────
+# Early (1-30d)      119     13.1    19.5    -8.3     -1.9     40.9%
+# Middle (31-60d)    118     18.5    23.0    -8.7     -4.2     50.2%
+# Late (61-90d)       73     18.2    24.3    -9.5     -3.4     52.0%
+# ─────────────────────────────────────────────────────────────────────
+# Difference tests (Middle vs Early):
+#  Exit: +5.4pp (p<0.001)***
+#  Net:  -2.2pp (p=0.085)*
+  
+# Difference tests (Late vs Middle):  
+#  Exit: -0.2pp (p=0.886) [no difference]
+#  Net:  +0.8pp (p=0.559) [no difference]
+
+# Note: All flows as % of baseline TSO. Net = Entry - Exit + Stayer.
+# Gross turnover = |Exit| + |Entry| + |Stayer|. Statistical tests use 
+# deal-level data. *** p<0.01, * p<0.10.
+
+
+#=================================================================================================
+# ---- Complete Model Fitting Pipeline -----------------------------------------------------------
+
+library(mgcv)
+library(segmented)
+library(quantreg)
+library(dplyr)
+library(ggplot2)
+
+# ---- Create Weekly Aggregation (Optimal Resolution) --------------------------------------------
+weekly_agg <- timing_data %>%
+  filter(deal_type == "Cash") %>%
+  mutate(week = floor(days_to_qtr_end / 7)) %>%
+  group_by(week) %>%
+  summarise(
+    n_deals = n(),
+    days_to_qtr_end = mean(days_to_qtr_end),
+    mean_exit = mean(exit_pct, na.rm = TRUE),
+    mean_entry = mean(entry_pct, na.rm = TRUE),
+    mean_net = mean(net_change_pct, na.rm = TRUE),
+    median_exit = median(exit_pct, na.rm = TRUE),
+    median_net = median(net_change_pct, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  filter(n_deals >= 5)  # Require at least 5 deals per week
+
+cat(sprintf("Weekly data: %d week-buckets\n", nrow(weekly_agg)))
+cat(sprintf("  Total deals: %d\n", sum(weekly_agg$n_deals)))
+cat(sprintf("  Mean deals/week: %.1f\n\n", mean(weekly_agg$n_deals)))
+
+# ---- Comprehensive Model Fitting Function ------------------------------------------------------
+
+fit_all_models <- function(data, outcome_var, data_name = "") {
+  
+  cat(sprintf("\nFitting models for: %s\n", data_name))
+  cat(strrep("-", 70), "\n")
+  
+  models <- list()
+  
+  # Linear models
+  models$linear <- lm(reformulate("days_to_qtr_end", outcome_var), 
+                     data = data, weights = n_deals)
+  
+  models$quad <- lm(reformulate("poly(days_to_qtr_end, 2)", outcome_var),
+                   data = data, weights = n_deals)
+  
+  models$cubic <- lm(reformulate("poly(days_to_qtr_end, 3)", outcome_var),
+                    data = data, weights = n_deals)
+  
+  # Splines
+  models$ns3 <- lm(reformulate("splines::ns(days_to_qtr_end, df=3)", outcome_var),
+                  data = data, weights = n_deals)
+  
+  models$ns4 <- lm(reformulate("splines::ns(days_to_qtr_end, df=4)", outcome_var),
+                  data = data, weights = n_deals)
+  
+  models$ns5 <- lm(reformulate("splines::ns(days_to_qtr_end, df=5)", outcome_var),
+                  data = data, weights = n_deals)
+  
+  # GAMs
+  models$gam_tp <- tryCatch(
+    gam(reformulate("s(days_to_qtr_end, bs='tp', k=5)", outcome_var),
+        data = data, weights = n_deals, method = "REML"),
+    error = function(e) NULL
+  )
+  
+  models$gam_cr <- tryCatch(
+    gam(reformulate("s(days_to_qtr_end, bs='cr', k=5)", outcome_var),
+        data = data, weights = n_deals, method = "REML"),
+    error = function(e) NULL
+  )
+  
+  # Segmented
+  lm_base <- models$linear
+  
+  models$seg1 <- tryCatch(
+    segmented(lm_base, seg.Z = ~days_to_qtr_end, npsi = 1,
+             control = seg.control(display = FALSE, it.max = 100)),
+    error = function(e) NULL
+  )
+  
+  models$seg2 <- tryCatch(
+    segmented(lm_base, seg.Z = ~days_to_qtr_end, npsi = 2,
+             control = seg.control(display = FALSE, it.max = 100)),
+    error = function(e) NULL
+  )
+  
+  # Model comparison
+  comparison <- tibble(Model = names(models)) %>%
+    mutate(
+      DF = map_int(Model, ~{
+        m <- models[[.x]]
+        if (is.null(m)) return(NA_integer_)
+        if (inherits(m, "segmented")) return(length(coef(m)))
+        if (inherits(m, "gam")) return(as.integer(sum(m$edf)))
+        length(coef(m))
+      }),
+      AIC = map_dbl(Model, ~{
+        m <- models[[.x]]
+        if (is.null(m)) return(NA_real_)
+        AIC(m)
+      }),
+      R2 = map_dbl(Model, ~{
+        m <- models[[.x]]
+        if (is.null(m)) return(NA_real_)
+        if (inherits(m, "gam")) return(summary(m)$r.sq)
+        summary(m)$r.squared
+      })
+    ) %>%
+    filter(!is.na(AIC)) %>%
+    arrange(AIC) %>%
+    mutate(Delta_AIC = AIC - min(AIC))
+  
+  best_name <- comparison$Model[1]
+  
+  cat(sprintf("✓ Best model: %s (AIC=%.1f, R²=%.3f)\n", 
+              best_name, min(comparison$AIC), comparison$R2[1]))
+  
+  list(models = models, comparison = comparison,
+       best_name = best_name, best_model = models[[best_name]])
+}
+
+# ---- Fit All Components ------------------------------------------------------------------------
+
+exit_models <- fit_all_models(weekly_agg, "mean_exit", "Cash Exit")
+entry_models <- fit_all_models(weekly_agg, "mean_entry", "Cash Entry")
+net_models <- fit_all_models(weekly_agg, "mean_net", "Cash Net Change")
+
+# Print comparison tables
+cat("\n\nEXIT MODEL COMPARISON:\n")
+print(exit_models$comparison, digits = 2)
+
+cat("\n\nENTRY MODEL COMPARISON:\n")
+print(entry_models$comparison, digits = 2)
+
+cat("\n\nNET MODEL COMPARISON:\n")
+print(net_models$comparison, digits = 2)
+
+# ---- Bootstrap Validation (Exit only - most important) -----------------------------------------
+
+boot_model_selection <- function(data, indices) {
+  d <- data[indices, ]
+  
+  models <- list(
+    linear = lm(mean_exit ~ days_to_qtr_end, data = d, weights = n_deals),
+    quad = lm(mean_exit ~ poly(days_to_qtr_end, 2), data = d, weights = n_deals),
+    ns3 = lm(mean_exit ~ splines::ns(days_to_qtr_end, df=3), data = d, weights = n_deals),
+    ns4 = lm(mean_exit ~ splines::ns(days_to_qtr_end, df=4), data = d, weights = n_deals)
+  )
+  
+  aics <- sapply(models, AIC)
+  names(which.min(aics))
+}
+
+set.seed(42)
+boot_results <- replicate(1000, {
+  indices <- sample(nrow(weekly_agg), replace = TRUE)
+  tryCatch(
+    boot_model_selection(weekly_agg, indices),
+    error = function(e) NA_character_
+  )
+})
+
+boot_table <- table(boot_results[!is.na(boot_results)])
+boot_df <- tibble(
+  Model = names(boot_table),
+  Frequency = as.integer(boot_table),
+  Share = Frequency / sum(Frequency)
+) %>%
+  arrange(desc(Frequency))
+
+print(boot_df, digits = 3)
+
+pct_nonlinear <- 100 * (1 - boot_df$Share[boot_df$Model == "linear"])
+cat(sprintf("\nNon-linear selected: %.1f%% of draws\n\n", pct_nonlinear))
+
+# ---- Predictions at Key Horizons ---------------------------------------------------------------
+
+horizons <- c(15, 30, 45, 60, 75)
+
+predictions_df <- map_dfr(horizons, ~{
+  exit_pred <- predict(exit_models$best_model, 
+                      newdata = tibble(days_to_qtr_end = .x), se.fit = TRUE)
+  entry_pred <- predict(entry_models$best_model,
+                       newdata = tibble(days_to_qtr_end = .x), se.fit = TRUE)
+  net_pred <- predict(net_models$best_model,
+                     newdata = tibble(days_to_qtr_end = .x), se.fit = TRUE)
+  
+  tibble(
+    Days = .x,
+    Exit_Est = exit_pred$fit,
+    Exit_SE = exit_pred$se.fit,
+    Entry_Est = entry_pred$fit,
+    Entry_SE = entry_pred$se.fit,
+    Net_Est = net_pred$fit,
+    Net_SE = net_pred$se.fit
+  )
+})
+
+print(predictions_df, digits = 2)
+
+# --- Create Figures -----------------------------------------------------------------------------
+
+# Fine grid for smooth curves
+pred_grid <- seq(1, 90, by = 1)
+
+# Predictions
+pred_exit <- predict(exit_models$best_model, 
+                    newdata = tibble(days_to_qtr_end = pred_grid), se.fit = TRUE)
+pred_entry <- predict(entry_models$best_model,
+                     newdata = tibble(days_to_qtr_end = pred_grid), se.fit = TRUE)
+pred_net <- predict(net_models$best_model,
+                   newdata = tibble(days_to_qtr_end = pred_grid), se.fit = TRUE)
+
+# FIGURE 1: Cumulative Exit
+p_exit <- ggplot() +
+  geom_ribbon(aes(x = pred_grid, 
+                  ymin = pred_exit$fit - 1.96*pred_exit$se.fit,
+                  ymax = pred_exit$fit + 1.96*pred_exit$se.fit),
+              fill = "steelblue", alpha = 0.2) +
+  geom_line(aes(x = pred_grid, y = pred_exit$fit), 
+            color = "steelblue", linewidth = 1.5) +
+  geom_point(data = weekly_agg, aes(x = days_to_qtr_end, y = mean_exit, size = n_deals),
+             color = "red", alpha = 0.6) +
+  scale_size_continuous(range = c(2, 8), name = "Deals/week") +
+  labs(
+    title = "Cumulative Institutional Exit (Cash Deals)",
+    subtitle = sprintf("Model: %s (AIC=%.1f, R²=%.2f) | Bootstrap: %.0f%% non-linear",
+                      exit_models$best_name, min(exit_models$comparison$AIC),
+                      exit_models$comparison$R2[1], pct_nonlinear),
+    x = "Days from Announcement to Quarter-End",
+    y = "Cumulative Exit (% of TSO)",
+    caption = "Points = weekly averages. Shaded = 95% CI."
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(plot.title = element_text(face = "bold", size = 15))
+
+print(p_exit)
+ggsave("figure_velocity_exit_final.png", p_exit, width = 10, height = 7, dpi = 300)
+
+# FIGURE 2: Three Components
+component_curves <- tibble(
+  days = pred_grid,
+  Exit = pred_exit$fit,
+  Entry = pred_entry$fit,
+  Net = pred_net$fit
+) %>%
+  tidyr::pivot_longer(cols = c(Exit, Entry, Net), names_to = "Component", values_to = "Value")
+
+p_components <- ggplot(component_curves, aes(x = days, y = Value, color = Component)) +
+  geom_line(linewidth = 1.3) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "gray50") +
+  geom_vline(xintercept = 45, linetype = "dotted", color = "gray40") +
+  scale_color_manual(values = c("Exit" = "red", "Entry" = "darkgreen", "Net" = "blue")) +
+  labs(
+    title = "Flow Decomposition: Exit, Entry, and Net Change",
+    subtitle = "All three components show rapid early activity, plateau by week 6-8",
+    x = "Days from Announcement",
+    y = "Flow (% of TSO for Exit/Entry, pp for Net)",
+    color = "Component"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(legend.position = "bottom")
+
+print(p_components)
+ggsave("figure_velocity_components.png", p_components, width = 10, height = 7, dpi = 300)
+
+# ---- Summary Table -----------------------------------------------------------------------------
+
+summary_table <- tibble(
+  Component = c("Exit", "Entry", "Net Change"),
+  Best_Model = c(exit_models$best_name, entry_models$best_name, net_models$best_name),
+  R2 = c(
+    exit_models$comparison$R2[1],
+    entry_models$comparison$R2[1],
+    net_models$comparison$R2[1]
+  ),
+  Pred_Week2 = c(predictions_df$Exit_Est[predictions_df$Days == 15],
+                 predictions_df$Entry_Est[predictions_df$Days == 15],
+                 predictions_df$Net_Est[predictions_df$Days == 15]),
+  Pred_Week6 = c(predictions_df$Exit_Est[predictions_df$Days == 45],
+                 predictions_df$Entry_Est[predictions_df$Days == 45],
+                 predictions_df$Net_Est[predictions_df$Days == 45]),
+  Pred_Week10 = c(predictions_df$Exit_Est[predictions_df$Days == 75],
+                  predictions_df$Entry_Est[predictions_df$Days == 75],
+                  predictions_df$Net_Est[predictions_df$Days == 75])
+)
+
+print(summary_table, digits = 2)
+
+# ---- Save --------------------------------------------------------------------------------------
+
+velocity_results <- list(
+  weekly_data = weekly_agg,
+  exit_models = exit_models,
+  entry_models = entry_models,
+  net_models = net_models,
+  bootstrap = boot_df,
+  predictions = predictions_df,
+  summary = summary_table
+)
+
+saveRDS(velocity_results, "velocity_analysis_final.rds")
+
+cat("Key findings:\n")
+cat(sprintf("  • Exit plateaus at %.1f%% (R²=%.2f)\n", 
+            mean(predictions_df$Exit_Est), exit_models$comparison$R2[1]))
+cat(sprintf("  • Entry rises from %.1f%% to %.1f%%\n",
+            predictions_df$Entry_Est[1], predictions_df$Entry_Est[5]))
+cat(sprintf("  • Peak net decline at week 6: %.1f pp\n",
+            predictions_df$Net_Est[predictions_df$Days == 45]))
+cat(sprintf("  • Bootstrap validates non-linearity: %.0f%%\n\n", pct_nonlinear))
+
+#=================================================================================================
+# STEP 16: STAYER ANALYSIS: Position Changes by Continuing Holders
+# Input: flow_panel, timing_data, target_panel
+# Output: Stayer behavior patterns by measurement window
+#=================================================================================================
+
+# Extract stayers
+stayers <- flow_panel %>%
+  filter(Stayer == 1) %>%
+  mutate(
+    shares_change = shares_t0 - shares_tm1,
+    pct_change = (shares_change / shares_tm1) * 100
+  )
+
+cat(sprintf("Stayer observations: %s\n", format(nrow(stayers), big.mark = ",")))
+cat(sprintf("  Increased: %d (%.1f%%)\n", sum(stayers$shares_change > 0),
+            100 * mean(stayers$shares_change > 0)))
+cat(sprintf("  Decreased: %d (%.1f%%)\n", sum(stayers$shares_change < 0),
+            100 * mean(stayers$shares_change < 0)))
+
+# Get TSO baseline
+tso_data <- target_panel %>%
+  filter(event_time == -1) %>%
+  select(master_deal_no, target_permno, TSO = TSO)
+
+# Deal-level stayer behavior
+deal_stayer <- stayers %>%
+  group_by(master_deal_no, permno) %>%
+  summarise(
+    n_stayers = n(),
+    n_decrease = sum(shares_change < 0),
+    total_change = sum(shares_change),
+    .groups = "drop"
+  ) %>%
+  left_join(
+    tso_data,
+    by = c("master_deal_no", "permno" = "target_permno")
+  ) %>%
+  filter(!is.na(TSO), TSO > 0) %>%
+  mutate(stayer_pct_tso = (total_change / TSO) * 100)
+
+# Add timing
+deal_stayer_timing <- deal_stayer %>%
+  left_join(
+    timing_data %>% select(master_deal_no, permno, days_to_qtr_end, deal_type),
+    by = c("master_deal_no", "permno")
+  ) %>%
+  filter(!is.na(days_to_qtr_end))
+
+# Weekly aggregation
+stayer_weekly <- deal_stayer_timing %>%
+  filter(deal_type == "Cash") %>%
+  mutate(week = floor(days_to_qtr_end / 7)) %>%
+  group_by(week) %>%
+  summarise(
+    N = n(),
+    Days_Mid = mean(days_to_qtr_end),
+    Stayer_Change = mean(stayer_pct_tso),
+    .groups = "drop"
+  )
+
+print(stayer_weekly, digits = 1)
+
+# Institution types
+stayer_types <- stayers %>%
+  group_by(mgrno) %>%
+  summarise(
+    n = n(),
+    n_increase = sum(shares_change > 0),
+    n_decrease = sum(shares_change < 0),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    type = case_when(
+      n_increase / n > 0.66 ~ "Increaser",
+      n_decrease / n > 0.66 ~ "Decreaser",
+      TRUE ~ "Mixed"
+    )
+  ) %>%
+  count(type) %>%
+  mutate(pct = n / sum(n) * 100)
+
+print(stayer_types, digits = 1)
+
+#=================================================================================================
+# STEP 17: STAYER-ONLY ELECTORATE ANALYSIS
+# Question: Among continuing holders, does the power structure shift?
+#=================================================================================================
+
+# ---- Get stayer holdings -----------------------------------------------------------------------
+stayer_holdings_tm1 <- flow_panel %>%
+  filter(Stayer == 1, shares_tm1 > 0) %>%
+  select(master_deal_no, permno, mgrno, shares_tm1)
+
+stayer_holdings_t0 <- flow_panel %>%
+  filter(Stayer == 1, shares_t0 > 0) %>%
+  select(master_deal_no, permno, mgrno, shares_t0)
+
+# Calculate all metrics for top-K stayers
+top_k_stayers <- function(k) {
+  
+  topk_tm1 <- stayer_holdings_tm1 %>%
+    group_by(master_deal_no, permno) %>%
+    arrange(desc(shares_tm1)) %>%
+    slice_head(n = k) %>%
+    mutate(weight = shares_tm1 / sum(shares_tm1)) %>%
+    ungroup()
+  
+  topk_t0 <- stayer_holdings_t0 %>%
+    group_by(master_deal_no, permno) %>%
+    arrange(desc(shares_t0)) %>%
+    slice_head(n = k) %>%
+    mutate(weight = shares_t0 / sum(shares_t0)) %>%
+    ungroup()
+  
+  deals <- topk_tm1 %>% distinct(master_deal_no, permno)
+  
+  deals %>%
+    mutate(
+      # Jaccard
+      jaccard = map2_dbl(master_deal_no, permno, ~{
+        mgrs_tm1 <- topk_tm1 %>% filter(master_deal_no == .x, permno == .y) %>% pull(mgrno)
+        mgrs_t0 <- topk_t0 %>% filter(master_deal_no == .x, permno == .y) %>% pull(mgrno)
+        if (length(mgrs_tm1) == 0 | length(mgrs_t0) == 0) return(NA_real_)
+        length(intersect(mgrs_tm1, mgrs_t0)) / length(union(mgrs_tm1, mgrs_t0))
+      }),
+      
+      # Cosine
+      cosine = map2_dbl(master_deal_no, permno, ~{
+        d_tm1 <- topk_tm1 %>% filter(master_deal_no == .x, permno == .y)
+        d_t0 <- topk_t0 %>% filter(master_deal_no == .x, permno == .y)
+        if (nrow(d_tm1) == 0 | nrow(d_t0) == 0) return(NA_real_)
+        
+        all_mgrs <- union(d_tm1$mgrno, d_t0$mgrno)
+        v1 <- sapply(all_mgrs, function(m) {
+          idx <- which(d_tm1$mgrno == m)
+          if (length(idx) > 0) d_tm1$weight[idx[1]] else 0
+        })
+        v2 <- sapply(all_mgrs, function(m) {
+          idx <- which(d_t0$mgrno == m)
+          if (length(idx) > 0) d_t0$weight[idx[1]] else 0
+        })
+        sum(v1 * v2) / (sqrt(sum(v1^2)) * sqrt(sum(v2^2)))
+      }),
+      
+      # HHI
+      hhi_tm1 = map2_dbl(master_deal_no, permno, ~{
+        w <- topk_tm1 %>% filter(master_deal_no == .x, permno == .y) %>% pull(weight)
+        if (length(w) == 0) return(NA_real_)
+        sum(w^2) * 10000
+      }),
+      
+      hhi_t0 = map2_dbl(master_deal_no, permno, ~{
+        w <- topk_t0 %>% filter(master_deal_no == .x, permno == .y) %>% pull(weight)
+        if (length(w) == 0) return(NA_real_)
+        sum(w^2) * 10000
+      }),
+      
+      delta_hhi = hhi_t0 - hhi_tm1,
+      jaccard_repl = (1 - jaccard) * 100,
+      cosine_repl = (1 - cosine) * 100
+    ) %>%
+    summarise(
+      K = k,
+      Jaccard = mean(jaccard_repl, na.rm = TRUE),
+      Cosine = mean(cosine_repl, na.rm = TRUE),
+      Delta_HHI = mean(delta_hhi, na.rm = TRUE)
+    )
+}
+
+# Calculate for K=5,10,20
+results_stayers <- map_dfr(c(5, 10, 20), top_k_stayers)
+
+# Comparison table
+comparison <- tibble(
+  K = c(5, 10, 20),
+  All_Holders_Jaccard = c(45.6, 50.9, 53.9),
+  Stayers_Jaccard = results_stayers$Jaccard,
+  All_Holders_Cosine = c(24.3, 23.0, 22.1),
+  Stayers_Cosine = results_stayers$Cosine,
+  All_Holders_HHI = c(18.7, 2.2, -23.6),
+  Stayers_HHI = results_stayers$Delta_HHI
+)
+
+print(comparison, digits = 1)
+
+# ---- Position Size vs Trim Analysis ------------------------------------------------------------
+
+# ---- stayer_dynamics to stayers ----------------------------------------------------------------
+  stayer_dynamics <- stayers %>%
+    left_join(
+      target_panel %>% filter(event_time == -1) %>%
+        select(target_permno, TSO_baseline = TSO),
+      by = c("permno" = "target_permno")
+    ) %>%
+    filter(!is.na(TSO_baseline), TSO_baseline > 0) %>%
+    mutate(
+      initial_pct_of_tso = (shares_tm1 / TSO_baseline) * 100,
+      pct_trim = -100 * (shares_change / shares_tm1),
+      size_category = case_when(
+        initial_pct_of_tso >= 5 ~ "Large (≥5% TSO)",
+        initial_pct_of_tso >= 1 ~ "Medium (1-5% TSO)",
+        initial_pct_of_tso >= 0.1 ~ "Small (0.1-1% TSO)",
+        TRUE ~ "Tiny (<0.1% TSO)"
+      )
+    )
+
+# Regression
+size_pred_model <- lm(abs(pct_trim) ~ log(initial_pct_of_tso + 0.01),
+                      data = stayer_dynamics %>% filter(shares_change != 0))
+
+cat("Regression: |% trim| ~ log(position size)\n")
+print(summary(size_pred_model)$coefficients, digits = 3)
+
+# ---- interpretation ------------------------------------------------------------------------------
+if (coef(size_pred_model)[2] < 0 &
+    abs(coef(size_pred_model)[2] / summary(size_pred_model)$coefficients[2, "Std. Error"]) > 1.96) {
+  cat("\n✓ CONFIRMED: Larger positions → SMALLER % trims\n")
+  cat("  → Large holders are STICKIER (trim less)\n")
+  cat("  → Medium holders trim most aggressively\n")
+  cat("  → This is why large holders maintain top-10 rank\n\n")
+} else {
+  cat("\n→ No strong relationship between size and trim %\n\n")
+}
+
+cat("But DOLLAR volume reverses this:\n")
+cat("  • Medium holders: 6.4% of stayers, 40.4% of $ trims\n")
+cat("  • Large holders: 1.5% of stayers, 23.8% of $ trims\n")
+cat("  → Medium holders DOMINATE capital flows\n\n")
+
+#=================================================================================================
+# STEP 18: Insider Ownership at Announcement
+# Input:  deals_with_io, target_panel, wrds connection
+# Output: insider_ownership_clean.rds
+#=================================================================================================
+
+# ---- Get CUSIP6 from CRSP for target PERMNOs ---------------------------------------------------
+target_permnos <- unique(deals_with_io$target_permno)
+
+cusip_query <- sprintf("
+  SELECT DISTINCT permno, ncusip, namedt, nameendt
+  FROM crsp.msenames
+  WHERE permno IN (%s) AND ncusip IS NOT NULL
+", paste(target_permnos, collapse = ","))
+
+permno_cusip <- dbGetQuery(wrds, cusip_query) %>%
+  as_tibble() %>%
+  mutate(
+    cusip6 = substr(ncusip, 1, 6),
+    namedt = as.Date(namedt),
+    nameendt = as.Date(coalesce(nameendt, as.Date("9999-12-31")))
+  )
+
+# ---- Map to announcement dates -----------------------------------------------------------------
+target_cusip_map <- deals_with_io %>%
+  transmute(
+    master_deal_no = as.character(master_deal_no),
+    target_permno = as.integer(target_permno),
+    dateann = as.Date(dateann),
+    t_0 = as.Date(t_0)
+  ) %>%
+  left_join(permno_cusip, by = c("target_permno" = "permno"),
+            relationship = "many-to-many") %>%
+  filter(namedt <= dateann, dateann <= nameendt) %>%
+  group_by(master_deal_no) %>%
+  slice_head(n = 1) %>%
+  ungroup() %>%
+  mutate(
+    window_start = dateann - (15 * 365),
+    window_end = t_0
+  ) %>%
+  filter(!is.na(cusip6)) %>%
+  select(master_deal_no, target_permno, cusip6, window_start, window_end)
+
+# ---- Build SQL for FactSet ---------------------------------------------------------------------
+keys_sql <- target_cusip_map %>%
+  mutate(
+    row_sql = sprintf("('%s', '%s', '%s', '%s')",
+                     master_deal_no, cusip6, window_start, window_end)
+  ) %>%
+  pull(row_sql) %>%
+  paste(collapse = ",\n")
+
+sql <- sprintf("
+  WITH deal_windows AS (
+    SELECT * FROM (VALUES %s) AS t(master_deal_no, cusip6, window_start, window_end)
+  ),
+  holdings AS (
+    SELECT
+      w.master_deal_no, t.personid, t.trandate, t.ownership,
+      COALESCE(t.sharesheld_adj, t.sharesheld, 0) AS shares,
+      ROW_NUMBER() OVER (
+        PARTITION BY w.master_deal_no, t.personid, t.ownership
+        ORDER BY t.trandate DESC
+      ) AS rn
+    FROM deal_windows w
+    JOIN tfn.table1 t ON t.cusip6 = w.cusip6
+    WHERE t.trandate >= w.window_start::date
+      AND t.trandate <= w.window_end::date
+      AND t.formtype IN ('3', '4', '5', '3/A', '4/A', '5/A')
+      AND t.ownership IN ('D', 'I')
+      AND (t.sectitle ILIKE '%%COM%%' OR t.sectitle ILIKE '%%COMMON%%')
+  )
+  SELECT * FROM holdings WHERE rn = 1;
+", keys_sql)
+
+insider_raw <- dbGetQuery(wrds, sql) %>% as_tibble()
+
+# Get TSO for normalization
+target_tso <- target_panel %>%
+  filter(event_time == 0) %>%
+  select(master_deal_no, target_permno, TSO_t0 = TSO)
+
+# Normalize PER-PERSON before aggregating
+insider_normalized <- insider_raw %>%
+  group_by(master_deal_no, personid) %>%
+  summarise(total_shares = sum(shares), .groups = "drop") %>%
+  left_join(target_cusip_map %>% select(master_deal_no, target_permno), by = "master_deal_no") %>%
+  left_join(target_tso, by = c("master_deal_no", "target_permno")) %>%
+  filter(!is.na(TSO_t0), TSO_t0 > 0) %>%
+  mutate(
+    person_pct = (total_shares / TSO_t0) * 100,
+    person_pct_wins = pmin(person_pct, 10)  # Winsorize per-person at 10%
+  )
+
+# ---- Aggregate to deal level -------------------------------------------------------------------
+insider_ownership_clean <- insider_normalized %>%
+  group_by(master_deal_no) %>%
+  summarise(
+    n_insiders = n(),
+    insider_pct_raw = sum(person_pct, na.rm = TRUE),
+    insider_pct = pmin(sum(person_pct_wins, na.rm = TRUE), 100),
+    max_individual = max(person_pct, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# ---- Summary -----------------------------------------------------------------------------------
+cat("\nInsider Ownership:\n")
+cat(sprintf("  Deals: %d\n", nrow(insider_ownership_clean)))
+cat(sprintf("  Mean: %.1f%%\n", mean(insider_ownership_clean$insider_pct)))
+cat(sprintf("  Median: %.1f%%\n", median(insider_ownership_clean$insider_pct)))
+cat(sprintf("  P25-P75: %.1f%% - %.1f%%\n",
+            quantile(insider_ownership_clean$insider_pct, 0.25),
+            quantile(insider_ownership_clean$insider_pct, 0.75)))
+
+saveRDS(insider_ownership_clean, "insider_ownership_clean.rds")
+
+#=================================================================================================
+# STEP 19: Risk Transformation Analysis
+# Input:  deals_with_io, target_panel, wrds connection
+# Output: Beta/correlation changes showing equity→bond transformation
+#=================================================================================================
+
+library(slider)
+
+# Use deals_with_io (already filtered for early closures)
+deals_for_risk <- deals_with_io %>%
+  transmute(
+    master_deal_no = as.character(master_deal_no),
+    target_permno = as.integer(target_permno),
+    acquirer_permno = as.integer(acquirer_permno),
+    dateann = as.Date(dateann),
+    dateeff = as.Date(dateeff),
+    start_date = dateann - 250,  # ~1 year trading days
+    end_date = pmin(dateann + 250, dateeff),  # Cap at completion
+    deal_type = case_when(
+      !is.na(pct_cash) & pct_cash >= 90 ~ "Cash",
+      !is.na(pct_stk) & pct_stk >= 90 ~ "Stock",
+      TRUE ~ "Mixed"
+    ),
+    deal_value
+  )
+
+cat(sprintf("Sample: %d deals\n\n", nrow(deals_for_risk)))
+
+# Get all PERMNOs
+all_permnos <- unique(c(deals_for_risk$target_permno, deals_for_risk$acquirer_permno))
+min_date <- min(deals_for_risk$start_date)
+max_date <- max(deals_for_risk$end_date)
+
+# Pull CRSP daily
+crsp_query <- sprintf("
+SELECT permno, date, ret, vol
+FROM crsp.dsf
+WHERE permno IN (%s)
+  AND date BETWEEN '%s' AND '%s'
+  AND ret IS NOT NULL
+", paste(all_permnos, collapse = ","), min_date, max_date)
+
+crsp_daily <- dbGetQuery(wrds, crsp_query) %>%
+  mutate(
+    date = as.Date(date),
+    ret = as.numeric(ret),
+    ret = if_else(abs(ret) > 2, NA_real_, ret),  # Remove extreme returns
+    vol = as.numeric(vol)
+  )
+
+# FF factors
+ff_query <- sprintf("
+SELECT date, mktrf, rf
+FROM ff.factors_daily
+WHERE date BETWEEN '%s' AND '%s'
+", min_date, max_date)
+
+ff_daily <- dbGetQuery(wrds, ff_query) %>%
+  mutate(
+    date = as.Date(date),
+    mktrf = as.numeric(mktrf) / 100,
+    rf = as.numeric(rf) / 100
+  )
+
+# Get acquirer returns separately
+acquirer_returns <- crsp_daily %>%
+  inner_join(
+    deals_for_risk %>%
+      select(master_deal_no, acquirer_permno) %>%
+      distinct(),
+    by = c("permno" = "acquirer_permno")
+  ) %>%
+  select(master_deal_no, date, acquirer_ret = ret)
+
+# Now merge target returns with FF factors AND acquirer returns
+daily_data <- crsp_daily %>%
+  inner_join(ff_daily, by = "date") %>%
+  inner_join(
+    deals_for_risk %>% select(master_deal_no, target_permno, acquirer_permno,
+                              dateann, dateeff, deal_type, deal_value,
+                              start_date, end_date),
+    by = c("permno" = "target_permno")
+  ) %>%
+  filter(date >= start_date, date <= end_date) %>%
+  left_join(acquirer_returns, by = c("master_deal_no", "date")) %>%  # ADD THIS JOIN
+  mutate(
+    days_rel = as.numeric(date - dateann),
+    ret_excess = ret - rf
+  )
+
+# Now the rolling metrics will work because acquirer_ret exists
+risk_metrics <- daily_data %>%
+  arrange(master_deal_no, date) %>%
+  group_by(master_deal_no) %>%
+  mutate(
+    mkt_beta = slide2_dbl(
+      ret_excess, mktrf,
+      ~{
+        if (sum(!is.na(.x) & !is.na(.y)) < 30) return(NA_real_)
+        cov(.x, .y, use = "complete.obs") / var(.y, use = "complete.obs")
+      },
+      .before = 59, .complete = FALSE
+    ),
+ 
+    mkt_corr = slide2_dbl(
+      ret, mktrf,
+      ~{
+        if (sum(!is.na(.x) & !is.na(.y)) < 30) return(NA_real_)
+        cor(.x, .y, use = "complete.obs")
+      },
+      .before = 59, .complete = FALSE
+    ),
+ 
+    acq_corr = slide2_dbl(
+      ret, acquirer_ret,
+      ~{
+        if (sum(!is.na(.x) & !is.na(.y)) < 30) return(NA_real_)
+        cor(.x, .y, use = "complete.obs")
+      },
+      .before = 59, .complete = FALSE
+    ),
+ 
+    idio_vol = slide_dbl(
+      ret_excess,
+      ~sd(.x, na.rm = TRUE),
+      .before = 59, .complete = FALSE
+    )
+  ) %>%
+  ungroup()
+
+# Calculate rolling metrics (60-day windows)
+
+risk_metrics <- daily_data %>%
+  arrange(master_deal_no, date) %>%
+  group_by(master_deal_no) %>%
+  mutate(
+    # Rolling market beta
+    mkt_beta = slide2_dbl(
+      ret_excess, mktrf,
+      ~{
+        if (sum(!is.na(.x) & !is.na(.y)) < 30) return(NA_real_)
+        cov(.x, .y, use = "complete.obs") / var(.y, use = "complete.obs")
+      },
+      .before = 59, .complete = FALSE
+    ),
+ 
+    # Rolling market correlation
+    mkt_corr = slide2_dbl(
+      ret, mktrf,
+      ~cor(.x, .y, use = "complete.obs"),
+      .before = 59, .complete = FALSE
+    ),
+ 
+    # Rolling acquirer correlation
+    acq_corr = slide2_dbl(
+      ret, acquirer_ret,
+      ~{
+        if (sum(!is.na(.x) & !is.na(.y)) < 30) return(NA_real_)
+        cor(.x, .y, use = "complete.obs")
+      },
+      .before = 59, .complete = FALSE
+    ),
+ 
+    # Rolling idiosyncratic volatility
+    idio_vol = slide_dbl(
+      ret_excess,
+      ~sd(.x, na.rm = TRUE),
+      .before = 59, .complete = FALSE
+    )
+  ) %>%
+  ungroup()
+
+# Define periods (use event-time windows)
+risk_by_period <- risk_metrics %>%
+  mutate(
+    period = case_when(
+      days_rel < -60 ~ "Pre (-250 to -60)",
+      days_rel >= -60 & days_rel < -1 ~ "Just Before (-60 to -1)",
+      days_rel >= 0 & days_rel < 60 ~ "Just After (0 to 60)",
+      days_rel >= 60 ~ "Post (60 to 250)"
+    )
+  ) %>%
+  filter(!is.na(period)) %>%
+  group_by(master_deal_no, deal_type, period) %>%
+  summarise(
+    n_days = n(),
+    mkt_beta = mean(mkt_beta, na.rm = TRUE),
+    mkt_corr = mean(mkt_corr, na.rm = TRUE),
+    acq_corr = mean(acq_corr, na.rm = TRUE),
+    idio_vol = mean(idio_vol, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  filter(n_days >= 20)
+
+# Summary table
+transformation_table <- risk_by_period %>%
+  group_by(deal_type, period) %>%
+  summarise(
+    N = n(),
+    Mkt_Beta = mean(mkt_beta, na.rm = TRUE),
+    Mkt_Corr = mean(mkt_corr, na.rm = TRUE),
+    Acq_Corr = mean(acq_corr, na.rm = TRUE),
+    Idio_Vol = mean(idio_vol, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+print(transformation_table, digits = 3)
+
+# Test changes
+cash_change <- risk_by_period %>%
+  filter(deal_type == "Cash") %>%
+  select(master_deal_no, period, mkt_corr, acq_corr) %>%
+  pivot_wider(names_from = period, values_from = c(mkt_corr, acq_corr)) %>%
+  mutate(
+    delta_mkt = `mkt_corr_Just After (0 to 60)` - `mkt_corr_Just Before (-60 to -1)`,
+    delta_acq = `acq_corr_Just After (0 to 60)` - `acq_corr_Just Before (-60 to -1)`
+  )
+
+cat("\n\nCash Deal Changes (Just Before → Just After):\n")
+cat(sprintf("  Market correlation: %.3f (t=%.2f, p=%.4f)\n",
+            mean(cash_change$delta_mkt, na.rm = TRUE),
+            t.test(cash_change$delta_mkt)$statistic,
+            t.test(cash_change$delta_mkt)$p.value))
+cat(sprintf("  Acquirer correlation: %.3f (t=%.2f, p=%.4f)\n\n",
+            mean(cash_change$delta_acq, na.rm = TRUE),
+            t.test(cash_change$delta_acq)$statistic,
+            t.test(cash_change$delta_acq)$p.value))
+
+saveRDS(list(
+  daily = risk_metrics,
+  summary = transformation_table,
+  changes = cash_change
+), "risk_transformation_results.rds")
+
+#===========================================================================================
+# STEP 20: Cross-Deal Arbitrage - Target/Acquirer Cross-Holdings in Stock Deals
+# Input:  institutional_holdings_granular, target_panel, mergers
+# Output: Analysis of institutions taking positions in counterparty
+#===========================================================================================
+
+# ---- Identify Deal Pairs (Target-Acquirer) -----------------------------------------------------
+
+deal_pairs <- mergers %>%
+  transmute(
+    master_deal_no = as.character(master_deal_no),
+    target_permno = as.integer(sub(";.*$", "", target_permno)),
+    acquirer_permno = as.integer(sub(";.*$", "", acquirer_permno)),
+    t_m1 = qend_prev(qend(dateann)),
+    t_0 = qend(dateann),
+    deal_value,
+    pct_cash,
+    pct_stk,
+    deal_type = case_when(
+      pct_cash >= 90 ~ "Cash",
+      pct_stk >= 90 ~ "Stock",
+      TRUE ~ "Mixed"
+    )
+  ) %>%
+  filter(!is.na(target_permno), !is.na(acquirer_permno)) %>%
+  # Focus on pure cash vs pure stock for clean comparison
+  filter(deal_type %in% c("Cash", "Stock"))
+
+cat(sprintf("Deal pairs: %d (Cash: %d, Stock: %d)\n",
+            nrow(deal_pairs),
+            sum(deal_pairs$deal_type == "Cash"),
+            sum(deal_pairs$deal_type == "Stock")))
+
+# ---- Get Holdings at t=-1 and t=0 -------------------------------------------------------------
+
+# Process target holdings at t=-1
+target_holdings_tm1 <- institutional_holdings_granular %>%
+  inner_join(
+    deal_pairs %>% select(master_deal_no, permno = target_permno, t_m1, deal_type),
+    by = c("permno", "rdate" = "t_m1")
+  ) %>%
+  filter(shares_adj > 0) %>%
+  distinct(master_deal_no, mgrno, deal_type) %>%
+  mutate(holds_target_tm1 = TRUE)
+
+# Process acquirer holdings at t=-1
+acquirer_holdings_tm1 <- institutional_holdings_granular %>%
+  inner_join(
+    deal_pairs %>% select(master_deal_no, permno = acquirer_permno, t_m1, deal_type),
+    by = c("permno", "rdate" = "t_m1")
+  ) %>%
+  filter(shares_adj > 0) %>%
+  distinct(master_deal_no, mgrno, deal_type) %>%
+  mutate(holds_acquirer_tm1 = TRUE)
+
+# Combine t=-1 holdings
+holdings_tm1 <- full_join(target_holdings_tm1, acquirer_holdings_tm1,
+                         by = c("master_deal_no", "mgrno", "deal_type")) %>%
+  mutate(
+    holds_target_tm1 = coalesce(holds_target_tm1, FALSE),
+    holds_acquirer_tm1 = coalesce(holds_acquirer_tm1, FALSE)
+  )
+
+cat(sprintf("Holdings at t=-1: %d manager-deal pairs\n", nrow(holdings_tm1)))
+
+# Process target holdings at t=0
+target_holdings_t0 <- institutional_holdings_granular %>%
+  inner_join(
+    deal_pairs %>% select(master_deal_no, permno = target_permno, t_0, deal_type),
+    by = c("permno", "rdate" = "t_0")
+  ) %>%
+  filter(shares_adj > 0) %>%
+  distinct(master_deal_no, mgrno, deal_type) %>%
+  mutate(holds_target_t0 = TRUE)
+
+# Process acquirer holdings at t=0
+acquirer_holdings_t0 <- institutional_holdings_granular %>%
+  inner_join(
+    deal_pairs %>% select(master_deal_no, permno = acquirer_permno, t_0, deal_type),
+    by = c("permno", "rdate" = "t_0")
+  ) %>%
+  filter(shares_adj > 0) %>%
+  distinct(master_deal_no, mgrno, deal_type) %>%
+  mutate(holds_acquirer_t0 = TRUE)
+
+# Combine t=0 holdings
+holdings_t0 <- full_join(target_holdings_t0, acquirer_holdings_t0,
+                        by = c("master_deal_no", "mgrno", "deal_type")) %>%
+  mutate(
+    holds_target_t0 = coalesce(holds_target_t0, FALSE),
+    holds_acquirer_t0 = coalesce(holds_acquirer_t0, FALSE)
+  )
+
+# ---- Identify Cross-Deal Arbitrage Patterns ---------------------------------------------------
+
+cross_holdings <- full_join(holdings_tm1, holdings_t0,
+                            by = c("master_deal_no", "mgrno", "deal_type")) %>%
+  mutate(
+    # Fill NAs (no holding = FALSE)
+    holds_target_tm1 = coalesce(holds_target_tm1, FALSE),
+    holds_acquirer_tm1 = coalesce(holds_acquirer_tm1, FALSE),
+    holds_target_t0 = coalesce(holds_target_t0, FALSE),
+    holds_acquirer_t0 = coalesce(holds_acquirer_t0, FALSE),
+ 
+    # Classify patterns at t=-1
+    target_only_tm1 = holds_target_tm1 & !holds_acquirer_tm1,
+    acquirer_only_tm1 = !holds_target_tm1 & holds_acquirer_tm1,
+    both_tm1 = holds_target_tm1 & holds_acquirer_tm1,
+    neither_tm1 = !holds_target_tm1 & !holds_acquirer_tm1,
+ 
+    # Cross-deal arbitrage indicators
+    # 1. Target holder adds acquirer position
+    target_adds_acquirer = target_only_tm1 & holds_acquirer_t0,
+ 
+    # 2. Acquirer holder adds target position
+    acquirer_adds_target = acquirer_only_tm1 & holds_target_t0,
+ 
+    # 3. Either cross-holding established
+    cross_arb = target_adds_acquirer | acquirer_adds_target
+  )
+
+cat(sprintf("Cross-holdings panel: %d manager-deal pairs\n", nrow(cross_holdings)))
+
+# ---- Aggregate Statistics ----------------------------------------------------------------------
+
+cat("\n\nCROSS-HOLDING PATTERNS:\n")
+cat("=" %>% rep(60) %>% paste(collapse = ""), "\n\n")
+
+cross_stats <- cross_holdings %>%
+  group_by(deal_type) %>%
+  summarise(
+    n_mgr_deal_pairs = n(),
+ 
+    # Baseline patterns at t=-1
+    n_target_only = sum(target_only_tm1),
+    n_acquirer_only = sum(acquirer_only_tm1),
+    n_both = sum(both_tm1),
+    n_neither = sum(neither_tm1),
+ 
+    # Cross-arbitrage activity
+    n_target_adds_acq = sum(target_adds_acquirer, na.rm = TRUE),
+    n_acq_adds_target = sum(acquirer_adds_target, na.rm = TRUE),
+    n_cross_arb = sum(cross_arb, na.rm = TRUE),
+ 
+    # Rates (conditional on being single-side holder)
+    rate_target_adds_acq = n_target_adds_acq / n_target_only * 100,
+    rate_acq_adds_target = n_acq_adds_target / n_acquirer_only * 100,
+ 
+    .groups = "drop"
+  )
+
+print(cross_stats)
+
+#=================================================================================================
+# STEP 21: Combined Output
+#=================================================================================================
+
+attrition <- target_panel %>%
+  group_by(event_time) %>%
+  summarise(
+    `N Deals` = n_distinct(master_deal_no),
+    `Mean IOR (%)` = mean(IOR * 100, na.rm = TRUE),
+    `N Missing` = sum(is.na(IOR)),
+    .groups = "drop"
+  ) %>%
+  arrange(event_time) %>%
+  filter(event_time >= -4, event_time <= 8)
+
+print_table(
+  attrition,
+  "TABLE 7: Sample Composition by Event Time",
+  "Number of deals with observed institutional ownership at each quarter relative to announcement. Sample attrition occurs as deals complete (median = 5 months) and post-merger integration eliminates target CUSIPs."
+)
+
+print(balance_table, digits = 2)
+print(p_overlap)
+
+modelsummary(
+  list("(1) Post" = es1, "(2) Binned" = es2, "(3) + Trends" = es3, "(4) Linear" = es4),
+  stars = c('***' = 0.01, '**' = 0.05, '*' = 0.1),
+  coef_rename = c(
+    "post" = "Post-announcement",
+    "pre_43" = "Pre: t=-4 to -3",
+    "pre_2" = "Pre: t=-2",
+    "post_0" = "Post: t=0",
+    "post_12" = "Post: t=1-2",
+    "post_34" = "Post: t=3-4",
+    "et" = "Trend (per qtr)",
+    "et:post" = "Post × Trend (break)"
+  ),
+  gof_map = c("nobs", "r.squared", "adj.r.squared"),
+  notes = c(
+    "Dependent variable: Institutional ownership ratio (%), 0-100 scale.",
+    "Reference period: t=-1 (quarter before announcement).",
+    "Cols (1)-(3): Firm and quarter FE. Col (3): + Firm×year trends. Col (4): Quarter FE only.",
+    "Standard errors clustered at firm level."
+  ),
+  output = "markdown"
+)
+
+summary(test_model)
+
+modelsummary(
+  list("(1) All Deals" = all_deals,
+       "(2) Cash ≥75%" = cash75,
+       "(3) Cash ≥90%" = cash90),
+  stars = c('***' = 0.01, '**' = 0.05, '*' = 0.1),
+  coef_rename = c(
+    "pre_43" = "Pre: t=-4 to -3",
+    "pre_2" = "Pre: t=-2",
+    "post_0" = "Post: t=0",
+    "post_12" = "Post: t=1-2",
+    "post_34" = "Post: t=3-4"
+  ),
+  gof_map = c("nobs", "r.squared"),
+  notes = c(
+    "Dependent variable: Institutional ownership ratio (%), 0-100 scale.",
+    "Reference period: t=-1. Firm and quarter FE. SEs clustered at firm level.",
+    "Column (1): All deals. Columns (2)-(3): Cash deals only (≥75% or ≥90% cash consideration)."
+  ),
+  output = "markdown"
+)
+
+summary(test_cash)
+
+modelsummary(
+  list("(1) All Deals" = all_deals, "(2) Stock ≥75%" = stock75, "(3) Stock ≥90%" = stock90),
+  stars = c('***' = 0.01, '**' = 0.05, '*' = 0.1),
+  coef_rename = c("pre_43" = "Pre: t=-4 to -3", "pre_2" = "Pre: t=-2",
+                  "post_0" = "Post: t=0", "post_12" = "Post: t=1-2", "post_34" = "Post: t=3-4"),
+  gof_map = c("nobs", "r.squared"),
+  output = "markdown"
+)
+
+modelsummary(
+  list(
+    "(1A) Level" = tgt_1a,
+    "(1B) Trend\nBreak" = tgt_1b,
+    "(1C) Post×Trend\n(with FE)" = tgt_1c,
+    "(1D) Saturated" = tgt_1d
+  ),
+  stars = c('***' = 0.01, '**' = 0.05, '*' = 0.1),
+  coef_rename = c(
+    "post" = "Post (level shift)",
+    "et" = "Trend (per qtr)",
+    "et:post" = "Post × Trend (break)",
+    "t_m4" = "t = -4",
+    "t_m3" = "t = -3",
+    "t_m2" = "t = -2",
+    "t_0" = "t = 0",
+    "t_1" = "t = 1",
+    "t_2" = "t = 2",
+    "t_3" = "t = 3",
+    "t_4" = "t = 4"
+  ),
+  gof_map = c("nobs", "r.squared"),
+  output = "markdown"
+)
+
+cat("Overall Statistics:\n")
+cat(sprintf("  Mean exit flow:       %.2f%% of TSO\n", mean(deals_panel$exit_pct)))
+cat(sprintf("  Mean entry flow:      %.2f%% of TSO\n", mean(deals_panel$entry_pct)))
+cat(sprintf("  Mean stayer change:   %.2f%% of TSO\n", mean(deals_panel$stayer_change_pct)))
+cat(sprintf("  Net change (decomp):  %.2f pp\n", mean(deals_panel$net_change_pct)))
+cat(sprintf("  Actual IOR change:    %.2f pp (verification)\n\n", mean(deals_panel$actual_IOR_change)))
+
+cat("Statistical Tests:\n")
+cat(sprintf("  Exit > 0:  t=%.2f, p=%.4f %s\n", t_exit$statistic, t_exit$p.value,
+            ifelse(t_exit$p.value < 0.01, "***", "")))
+cat(sprintf("  Entry > 0: t=%.2f, p=%.4f %s\n", t_entry$statistic, t_entry$p.value,
+            ifelse(t_entry$p.value < 0.01, "***", "")))
+cat(sprintf("  Net ≠ 0:   t=%.2f, p=%.4f %s\n\n", t_net$statistic, t_net$p.value,
+            ifelse(t_net$p.value < 0.01, "***", "")))
+
+print(by_type, width = Inf)
+
+print(combined, digits = 2)
+
+print(did_test, digits = 2)
+
+print(entry_dist, digits = 2)
+
+cat(sprintf("Top 10%% of entrants account for:\n"))
+cat(sprintf("  %.1f%% of entry events\n", top_10$cum_entries * 100))
+cat(sprintf("  %.1f%% of entry volume (shares)\n\n", top_10$cum_volume * 100))
+
+cat(sprintf("Top 5%% of entrants account for:\n"))
+cat(sprintf("  %.1f%% of entry events\n", top_5$cum_entries * 100))
+cat(sprintf("  %.1f%% of entry volume (shares)\n\n", top_5$cum_volume * 100))
+
+cat(sprintf("Top 1%% of entrants account for:\n"))
+cat(sprintf("  %.1f%% of entry events\n", top_1$cum_entries * 100))
+cat(sprintf("  %.1f%% of entry volume (shares)\n\n", top_1$cum_volume * 100))
+
+print(final_comp, digits = 2)
+
+cat("\n\nCONCENTRATION (GINI COEFFICIENTS):\n")
+cat(strrep("=", 60), "\n")
+cat(sprintf("Entry events (# deals):  %.3f\n", gini_entries))
+cat(sprintf("Entry volume (shares):   %.3f\n\n", gini_volume))
+
+print(weekly_flows_cash, digits = 1, width = Inf)
+
+print(coarse_decomp, digits = 1, width = Inf)
+
+print(cash_coarse, digits = 1, width = Inf)
+
+cat("Middle vs Early:\n")
+cat(sprintf("  Exit difference: %.1f pp (p=%.3f) %s\n",
+            mean(middle_cash$exit_pct) - mean(early_cash$exit_pct),
+            t_exit$p.value,
+            ifelse(t_exit$p.value < 0.05, "**", "")))
+cat(sprintf("  Net difference:  %.1f pp (p=%.3f) %s\n\n",
+            mean(middle_cash$net_change_pct) - mean(early_cash$net_change_pct),
+            t_net$p.value,
+            ifelse(t_net$p.value < 0.05, "**", "")))
+
+# Test if late differs from middle
+t_exit_late <- t.test(late_cash$exit_pct, middle_cash$exit_pct)
+t_net_late <- t.test(late_cash$net_change_pct, middle_cash$net_change_pct)
+
+cat("Late vs Middle:\n")
+cat(sprintf("  Exit difference: %.1f pp (p=%.3f) %s\n",
+            mean(late_cash$exit_pct) - mean(middle_cash$exit_pct),
+            t_exit_late$p.value,
+            ifelse(t_exit_late$p.value < 0.05, "**", "")))
+cat(sprintf("  Net difference:  %.1f pp (p=%.3f) %s\n\n",
+            mean(late_cash$net_change_pct) - mean(middle_cash$net_change_pct),
+            t_net_late$p.value,
+            ifelse(t_net_late$p.value < 0.05, "**", "")))
+
+cat(sprintf("Weekly data: %d week-buckets\n", nrow(weekly_agg)))
+cat(sprintf("  Total deals: %d\n", sum(weekly_agg$n_deals)))
+cat(sprintf("  Mean deals/week: %.1f\n\n", mean(weekly_agg$n_deals)))
+
+cat("\n\nEXIT MODEL COMPARISON:\n")
+print(exit_models$comparison, digits = 2)
+
+cat("\n\nENTRY MODEL COMPARISON:\n")
+print(entry_models$comparison, digits = 2)
+
+cat("\n\nNET MODEL COMPARISON:\n")
+print(net_models$comparison, digits = 2)
+
+print(boot_df, digits = 3)
+
+pct_nonlinear <- 100 * (1 - boot_df$Share[boot_df$Model == "linear"])
+cat(sprintf("\nNon-linear selected: %.1f%% of draws\n\n", pct_nonlinear))
+
+print(predictions_df, digits = 2)
+
+print(p_exit)
+
+print(p_components)
+
+print(summary_table, digits = 2)
+
+cat("Key findings:\n")
+cat(sprintf("  • Exit plateaus at %.1f%% (R²=%.2f)\n",
+            mean(predictions_df$Exit_Est), exit_models$comparison$R2[1]))
+cat(sprintf("  • Entry rises from %.1f%% to %.1f%%\n",
+            predictions_df$Entry_Est[1], predictions_df$Entry_Est[5]))
+cat(sprintf("  • Peak net decline at week 6: %.1f pp\n",
+            predictions_df$Net_Est[predictions_df$Days == 45]))
+cat(sprintf("  • Bootstrap validates non-linearity: %.0f%%\n\n", pct_nonlinear))
+
+
+cat(sprintf("Stayer observations: %s\n", format(nrow(stayers), big.mark = ",")))
+cat(sprintf("  Increased: %d (%.1f%%)\n", sum(stayers$shares_change > 0),
+            100 * mean(stayers$shares_change > 0)))
+cat(sprintf("  Decreased: %d (%.1f%%)\n", sum(stayers$shares_change < 0),
+            100 * mean(stayers$shares_change < 0)))
+
+print(stayer_weekly, digits = 1)
+
+print(stayer_types, digits = 1)
+
+print(comparison, digits = 1)
+
+print(summary(size_pred_model)$coefficients, digits = 3)
+
+cat("\nInsider Ownership:\n")
+cat(sprintf("  Deals: %d\n", nrow(insider_ownership_clean)))
+cat(sprintf("  Mean: %.1f%%\n", mean(insider_ownership_clean$insider_pct)))
+cat(sprintf("  Median: %.1f%%\n", median(insider_ownership_clean$insider_pct)))
+cat(sprintf("  P25-P75: %.1f%% - %.1f%%\n",
+            quantile(insider_ownership_clean$insider_pct, 0.25),
+            quantile(insider_ownership_clean$insider_pct, 0.75)))
+
+cat(sprintf("Sample: %d deals\n\n", nrow(deals_for_risk)))
+
+print(transformation_table, digits = 3)
+
+cat("\n\nCash Deal Changes (Just Before → Just After):\n")
+cat(sprintf("  Market correlation: %.3f (t=%.2f, p=%.4f)\n",
+            mean(cash_change$delta_mkt, na.rm = TRUE),
+            t.test(cash_change$delta_mkt)$statistic,
+            t.test(cash_change$delta_mkt)$p.value))
+cat(sprintf("  Acquirer correlation: %.3f (t=%.2f, p=%.4f)\n\n",
+            mean(cash_change$delta_acq, na.rm = TRUE),
+            t.test(cash_change$delta_acq)$statistic,
+            t.test(cash_change$delta_acq)$p.value))
+
+print(cross_stats, width = Inf)
