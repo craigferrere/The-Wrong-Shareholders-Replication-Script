@@ -6,7 +6,7 @@ The script studies what happens to who owns a company **after a merger is announ
 
 In short, it traces whether the shareholders who vote on a deal are the same shareholders who owned the company when the deal was signed. To do this, it combines merger data, stock data, and institutional holdings data from WRDS and then runs a sequence of event-study and decomposition analyses.
 
-his project relies on licensed WRDS datasets. You will need:
+This project relies on licensed WRDS datasets. You will need:
 - a working WRDS account,
 - permission to query the required databases/tables,
 - an active R connection object named `wrds` before running the script.
