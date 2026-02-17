@@ -3176,6 +3176,155 @@ cross_stats <- cross_holdings %>%
 print(cross_stats)
 
 #=================================================================================================
+# Step 21: CASE STUDIES TABLE: Kahan & Rock (Top-20 overlap + gross flows)
+# Inputs: target_panel, institutional_holdings_granular
+# Notes:
+#   - Overlap metrics (Jaccard, Cosine) are computed on Top-20 holders.
+#   - Cosine uses pctTSO vectors over the union of Top-20 identities (as table note states).
+#   - Entrants = sum pctTSO at end among mgrno absent at start.
+#   - Leavers  = sum pctTSO at start among mgrno absent at end.
+#=================================================================================================
+
+library(dplyr)
+library(tidyr)
+library(purrr)
+library(knitr)
+library(kableExtra)
+
+# ---------- helpers (overlap, not replacement) --------------------------------------------------
+jaccard_overlap <- function(ids_a, ids_b) {
+  ids_a <- unique(ids_a); ids_b <- unique(ids_b)
+  if (length(ids_a) == 0 || length(ids_b) == 0) return(NA_real_)
+  inter <- length(intersect(ids_a, ids_b))
+  uni   <- length(union(ids_a, ids_b))
+  if (uni == 0) NA_real_ else inter / uni
+}
+
+cosine_overlap_pct <- function(df_a, df_b, id_col = "mgrno", w_col = "pct_tso") {
+  # cosine similarity of pctTSO vectors over union of ids
+  ids <- union(df_a[[id_col]], df_b[[id_col]])
+  if (length(ids) == 0) return(NA_real_)
+
+  a <- df_a %>% select(id = all_of(id_col), w = all_of(w_col)) %>% distinct(id, .keep_all = TRUE)
+  b <- df_b %>% select(id = all_of(id_col), w = all_of(w_col)) %>% distinct(id, .keep_all = TRUE)
+
+  u <- tibble(id = ids) %>%
+    left_join(a, by = "id") %>% rename(w_a = w) %>%
+    left_join(b, by = "id") %>% rename(w_b = w) %>%
+    mutate(
+      w_a = replace_na(w_a, 0),
+      w_b = replace_na(w_b, 0)
+    )
+
+  num <- sum(u$w_a * u$w_b)
+  den <- sqrt(sum(u$w_a^2)) * sqrt(sum(u$w_b^2))
+  if (den == 0) NA_real_ else num / den
+}
+
+gross_flows_pct <- function(df_a, df_b, id_col = "mgrno", w_col = "pct_tso") {
+  # entrants: at end, absent at start (end weights)
+  # leavers:  at start, absent at end (start weights)
+  a <- df_a %>% select(id = all_of(id_col), w0 = all_of(w_col)) %>% distinct(id, .keep_all = TRUE)
+  b <- df_b %>% select(id = all_of(id_col), w1 = all_of(w_col)) %>% distinct(id, .keep_all = TRUE)
+
+  ids_a <- a$id; ids_b <- b$id
+  entrants_ids <- setdiff(ids_b, ids_a)
+  leavers_ids  <- setdiff(ids_a, ids_b)
+
+  entrants <- b %>% filter(id %in% entrants_ids) %>% summarise(x = sum(w1, na.rm = TRUE)) %>% pull(x)
+  leavers  <- a %>% filter(id %in% leavers_ids)  %>% summarise(x = sum(w0, na.rm = TRUE)) %>% pull(x)
+
+  tibble(Entrants = entrants, Leavers = leavers)
+}
+
+# ---------- deal list ---------------------------------------------------------------------------
+case_deals <- tibble::tribble(
+  ~master_deal_no, ~deal_label,
+  "2974484020", "Tesla--SolarCity (SCTY)",
+  "4147606020", "Chevron--Hess (HES)"
+)
+
+# ---------- windows for panels ------------------------------------------------------------------
+panels <- tibble::tribble(
+  ~panel, ~t0, ~t1,
+  "Panel A. $t=-1 \\rightarrow t=0$", -1L, 0L,
+  "Panel B. $t=0 \\rightarrow t=1$",  0L, 1L,
+  "Panel C. $t=-1 \\rightarrow t=1$", -1L, 1L
+)
+
+K <- 20L
+
+# ---------- prepare quarter grid + join holdings ------------------------------------------------
+# Target-side only; we need rdate & TSO for pctTSO
+quarters_needed <- target_panel %>%
+  filter(firm_type == "target", event_time %in% c(-1, 0, 1)) %>%
+  transmute(
+    master_deal_no = as.character(master_deal_no),
+    target_permno  = as.integer(target_permno),
+    event_time     = as.integer(event_time),
+    rdate,
+    TSO
+  ) %>%
+  semi_join(case_deals, by = "master_deal_no") %>%
+  distinct()
+
+# Deal-quarter-institution holdings with pctTSO
+holdings_cs <- institutional_holdings_granular %>%
+  inner_join(quarters_needed, by = c("permno" = "target_permno", "rdate")) %>%
+  filter(shares_adj > 0) %>%
+  transmute(
+    master_deal_no,
+    permno,
+    event_time,
+    mgrno,
+    shares   = shares_adj,
+    TSO,
+    pct_tso  = 100 * shares_adj / TSO
+  )
+
+# ---------- function: compute metrics for one deal and one (t0,t1) -------------------------------
+compute_case_metrics <- function(deal_id, t0, t1, k = 20L) {
+  # top-k by shares at each endpoint
+  top0 <- holdings_cs %>%
+    filter(master_deal_no == deal_id, event_time == t0) %>%
+    group_by(master_deal_no, permno, event_time) %>%
+    arrange(desc(shares)) %>%
+    slice_head(n = k) %>%
+    ungroup()
+
+  top1 <- holdings_cs %>%
+    filter(master_deal_no == deal_id, event_time == t1) %>%
+    group_by(master_deal_no, permno, event_time) %>%
+    arrange(desc(shares)) %>%
+    slice_head(n = k) %>%
+    ungroup()
+
+  if (nrow(top0) == 0 || nrow(top1) == 0) {
+    return(tibble(Jaccard = NA_real_, Cosine = NA_real_, Entrants = NA_real_, Leavers = NA_real_))
+  }
+
+  jac <- jaccard_overlap(top0$mgrno, top1$mgrno)
+  cos <- cosine_overlap_pct(top0, top1, id_col = "mgrno", w_col = "pct_tso")
+  flw <- gross_flows_pct(top0, top1, id_col = "mgrno", w_col = "pct_tso")
+
+  tibble(Jaccard = jac, Cosine = cos) %>% bind_cols(flw)
+}
+
+# ---------- build table frame -------------------------------------------------------------------
+case_studies <- crossing(case_deals, panels) %>%
+  mutate(metrics = pmap(list(master_deal_no, t0, t1), ~compute_case_metrics(..1, ..2, ..3, k = K))) %>%
+  unnest(metrics) %>%
+  mutate(
+    Jaccard = round(Jaccard, 3),
+    Cosine  = round(Cosine, 3),
+    Entrants = round(Entrants, 2),
+    Leavers  = round(Leavers, 2)
+  ) %>%
+  select(panel, deal_label, Jaccard, Cosine, Entrants, Leavers)
+
+print(case_studies, n = Inf)
+
+#=================================================================================================
 # STEP 21: Combined Output
 #=================================================================================================
 
