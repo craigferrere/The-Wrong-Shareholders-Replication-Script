@@ -246,9 +246,7 @@ matched <- bind_rows(matched, m4b %>% distinct(master_deal_no)) %>% distinct()
 
 m5 <- xk %>%
  anti_join(matched, by = "master_deal_no") %>%
- filter(!is.na(ticker)) %>%
- select(master_deal_no, asof, ticker) %>%
- left_join(sn_t, by = "ticker", relationship = "many-to-many") %>%
+ select(master_deal_no, asof) %>%
  filter(!is.na(permno)) %>%
  pick_best_by_date()
 
