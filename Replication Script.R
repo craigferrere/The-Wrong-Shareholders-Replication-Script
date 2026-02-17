@@ -244,12 +244,6 @@ m4b <- xk %>%
 
 matched <- bind_rows(matched, m4b %>% distinct(master_deal_no)) %>% distinct()
 
-m5 <- xk %>%
- anti_join(matched, by = "master_deal_no") %>%
- select(master_deal_no, asof) %>%
- filter(!is.na(permno)) %>%
- pick_best_by_date()
-
 # ---- combine + attach --------------------------------------------------------------------------
 x_map <- bind_rows(m1, m2, m3, m4a, m4b) %>%
  distinct(master_deal_no, permno) %>%
@@ -273,7 +267,7 @@ mergers_analysis <- mergers_analysis %>%
  )
 
 # ---- clear intermediate objects ----------------------------------------------------------------
-rm("ccm","m1","m2","m3","m4a","m4b", "m5", "cus6", "sn2_cols", "sn_cols", "sn","sn_t","sn2","x_map","xk", "matched", "ccm_cols", "sn2_cusip_field", "ccm_permno_col")
+rm("ccm","m1","m2","m3","m4a","m4b", "cus6", "sn2_cols", "sn_cols", "sn","sn_t","sn2","x_map","xk", "matched", "ccm_cols", "sn2_cusip_field", "ccm_permno_col")
 
 # ---- target permno -----------------------------------------------------------------------------
 # ---- keys --------------------------------------------------------------------------------------
