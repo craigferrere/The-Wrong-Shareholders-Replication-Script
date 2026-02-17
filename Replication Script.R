@@ -244,27 +244,6 @@ m4b <- xk %>%
 
 matched <- bind_rows(matched, m4b %>% distinct(master_deal_no)) %>% distinct()
 
-tickers <- xk %>%
- anti_join(matched, by = "master_deal_no") %>%
- filter(!is.na(ticker)) %>%
- distinct(ticker) %>%
- pull(ticker)
-
-sn_t <- if (length(tickers) > 0) {
- tbl(wrds, in_schema("crsp", "stocknames")) %>%
-   filter(toupper(ticker) %in% tickers) %>%
-   transmute(
-     permno    = permno,
-     ticker    = toupper(ticker),
-     namedt    = as.Date(namedt),
-     nameenddt = as.Date(nameenddt)
-   ) %>%
-   collect()
-} else {
- tibble(permno = integer(), ticker = character(),
-        namedt = as.Date(character()), nameenddt = as.Date(character()))
-}
-
 m5 <- xk %>%
  anti_join(matched, by = "master_deal_no") %>%
  filter(!is.na(ticker)) %>%
