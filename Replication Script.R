@@ -1396,7 +1396,7 @@ panel_analysis <- matched_panel %>%
     dIOR = (IOR - IOR_baseline) * 100
   ) %>%
   group_by(master_deal_no, firm_permno) %>%
-  mutate(IOR_baseline = first(na.omit(IOR_baseline))) %>%
+  mutate(IOR_baseline = dplyr::first(na.omit(IOR_baseline))) %>%
   ungroup() %>%
   filter(!is.na(IOR_baseline), !is.na(dIOR))
 
@@ -2747,198 +2747,280 @@ cat(sprintf("  P25-P75: %.1f%% - %.1f%%\n",
 saveRDS(insider_ownership_clean, "insider_ownership_clean.rds")
 
 #=================================================================================================
-# STEP 19: Risk Transformation Analysis
-# Input:  deals_with_io, target_panel, wrds connection
-# Output: Beta/correlation changes showing equity→bond transformation
+# STEP 19 (Corrected): Risk Transformation Analysis
+# Inputs:  deals_with_io, wrds connection
+# Outputs: Target risk transformation table (Just Before vs Just After) + RDS results
+# Notes:
+#   - Computes metrics directly within event windows (no rolling contamination).
+#   - Idiosyncratic volatility = SD(residuals) from market model on excess returns.
+#   - Market correlation uses excess returns (ret - rf) vs mktrf (already excess).
 #=================================================================================================
 
-library(slider)
+library(dplyr)
+library(tidyr)
 
-# Use deals_with_io (already filtered for early closures)
+# ----------------------------
+# 19.0 Deal sample for risk
+# ----------------------------
 deals_for_risk <- deals_with_io %>%
- transmute(
-   master_deal_no = as.character(master_deal_no),
-   target_permno = as.integer(target_permno),
-   acquirer_permno = as.integer(acquirer_permno),
-   dateann = as.Date(dateann),
-   dateeff = as.Date(dateeff),
-   start_date = dateann - 250,  # ~1 year trading days
-   end_date = pmin(dateann + 250, dateeff),  # Cap at completion
-   deal_type = case_when(
-     !is.na(pct_cash) & pct_cash >= 90 ~ "Cash",
-     !is.na(pct_stk) & pct_stk >= 90 ~ "Stock",
-     TRUE ~ "Mixed"
-   ),
-   deal_value
- )
+  transmute(
+    master_deal_no  = as.character(master_deal_no),
+    target_permno   = as.integer(target_permno),
+    acquirer_permno = as.integer(acquirer_permno),
+    dateann         = as.Date(dateann),
+    dateeff         = as.Date(dateeff),
+    start_date      = dateann - 250,
+    end_date        = pmin(dateann + 250, dateeff),
+    deal_type       = case_when(
+      !is.na(pct_cash) & pct_cash >= 90 ~ "All Cash",
+      !is.na(pct_stk)  & pct_stk  >= 90 ~ "All Stock",
+      TRUE ~ "Mixed"
+    ),
+    deal_value
+  ) %>%
+  filter(!is.na(target_permno), !is.na(acquirer_permno), !is.na(dateann)) %>%
+  distinct(master_deal_no, .keep_all = TRUE)
 
-cat(sprintf("Sample: %d deals\n\n", nrow(deals_for_risk)))
+cat(sprintf("STEP 19 sample: %d deals\n\n", nrow(deals_for_risk)))
 
-# Get all PERMNOs
 all_permnos <- unique(c(deals_for_risk$target_permno, deals_for_risk$acquirer_permno))
-min_date <- min(deals_for_risk$start_date)
-max_date <- max(deals_for_risk$end_date)
+min_date <- min(deals_for_risk$start_date, na.rm = TRUE)
+max_date <- max(deals_for_risk$end_date, na.rm = TRUE)
 
-# Pull CRSP daily
+# ----------------------------
+# 19.1 Pull CRSP daily returns
+# ----------------------------
 crsp_query <- sprintf("
-SELECT permno, date, ret, vol
+SELECT permno, date, ret
 FROM crsp.dsf
 WHERE permno IN (%s)
- AND date BETWEEN '%s' AND '%s'
- AND ret IS NOT NULL
+  AND date BETWEEN '%s' AND '%s'
+  AND ret IS NOT NULL
 ", paste(all_permnos, collapse = ","), min_date, max_date)
 
 crsp_daily <- dbGetQuery(wrds, crsp_query) %>%
- mutate(
-   date = as.Date(date),
-   ret = as.numeric(ret),
-   ret = if_else(abs(ret) > 2, NA_real_, ret),  # Remove extreme returns
-   vol = as.numeric(vol)
- )
+  mutate(
+    date = as.Date(date),
+    ret  = as.numeric(ret),
+    # Drop clearly bad daily return codes/outliers; adjust threshold if needed
+    ret  = if_else(is.na(ret) | abs(ret) > 2, NA_real_, ret)
+  )
 
-# FF factors
+# ----------------------------
+# 19.2 Pull FF daily (mktrf, rf)
+# ----------------------------
 ff_query <- sprintf("
 SELECT date, mktrf, rf
 FROM ff.factors_daily
 WHERE date BETWEEN '%s' AND '%s'
 ", min_date, max_date)
 
-ff_daily <- dbGetQuery(wrds, ff_query) %>%
- mutate(
-   date = as.Date(date),
-   mktrf = as.numeric(mktrf) / 100,
-   rf = as.numeric(rf) / 100
- )
-
-# Get acquirer returns separately
-acquirer_returns <- crsp_daily %>%
- inner_join(
-   deals_for_risk %>%
-     select(master_deal_no, acquirer_permno) %>%
-     distinct(),
-   by = c("permno" = "acquirer_permno")
- ) %>%
- select(master_deal_no, date, acquirer_ret = ret)
-
-# Now merge target returns with FF factors AND acquirer returns
-daily_data <- crsp_daily %>%
- inner_join(ff_daily, by = "date") %>%
- inner_join(
-   deals_for_risk %>% select(master_deal_no, target_permno, acquirer_permno,
-                             dateann, dateeff, deal_type, deal_value,
-                             start_date, end_date),
-   by = c("permno" = "target_permno")
- ) %>%
- filter(date >= start_date, date <= end_date) %>%
- left_join(acquirer_returns, by = c("master_deal_no", "date")) %>%  # ADD THIS JOIN
- mutate(
-   days_rel = as.numeric(date - dateann),
-   ret_excess = ret - rf
- )
-
-# Calculate rolling metrics (60-day windows)
-
-risk_metrics <- daily_data %>%
- arrange(master_deal_no, date) %>%
- group_by(master_deal_no) %>%
- mutate(
-   # Rolling market beta
-   mkt_beta = slide2_dbl(
-     ret_excess, mktrf,
-     ~{
-       if (sum(!is.na(.x) & !is.na(.y)) < 30) return(NA_real_)
-       cov(.x, .y, use = "complete.obs") / var(.y, use = "complete.obs")
-     },
-     .before = 59, .complete = FALSE
-   ),
-
-   # Rolling market correlation
-   mkt_corr = slide2_dbl(
-     ret, mktrf,
-     ~cor(.x, .y, use = "complete.obs"),
-     .before = 59, .complete = FALSE
-   ),
-
-   # Rolling acquirer correlation
-   acq_corr = slide2_dbl(
-     ret, acquirer_ret,
-     ~{
-       if (sum(!is.na(.x) & !is.na(.y)) < 30) return(NA_real_)
-       cor(.x, .y, use = "complete.obs")
-     },
-     .before = 59, .complete = FALSE
-   ),
-
-   # Rolling idiosyncratic volatility
-   idio_vol = slide_dbl(
-     ret_excess,
-     ~sd(.x, na.rm = TRUE),
-     .before = 59, .complete = FALSE
-   )
- ) %>%
- ungroup()
-
-# Define periods (use event-time windows)
-risk_by_period <- risk_metrics %>%
- mutate(
-   period = case_when(
-     days_rel < -60 ~ "Pre (-250 to -60)",
-     days_rel >= -60 & days_rel < -1 ~ "Just Before (-60 to -1)",
-     days_rel >= 0 & days_rel < 60 ~ "Just After (0 to 60)",
-     days_rel >= 60 ~ "Post (60 to 250)"
-   )
- ) %>%
- filter(!is.na(period)) %>%
- group_by(master_deal_no, deal_type, period) %>%
- summarise(
-   n_days = n(),
-   mkt_beta = mean(mkt_beta, na.rm = TRUE),
-   mkt_corr = mean(mkt_corr, na.rm = TRUE),
-   acq_corr = mean(acq_corr, na.rm = TRUE),
-   idio_vol = mean(idio_vol, na.rm = TRUE),
-   .groups = "drop"
- ) %>%
- filter(n_days >= 20)
-
-# Summary table
-transformation_table <- risk_by_period %>%
- group_by(deal_type, period) %>%
- summarise(
-   N = n(),
-   Mkt_Beta = mean(mkt_beta, na.rm = TRUE),
-   Mkt_Corr = mean(mkt_corr, na.rm = TRUE),
-   Acq_Corr = mean(acq_corr, na.rm = TRUE),
-   Idio_Vol = mean(idio_vol, na.rm = TRUE),
-   .groups = "drop"
- )
-
-print(transformation_table, digits = 3)
-
-# Test changes
-cash_change <- risk_by_period %>%
-  filter(deal_type == "Cash") %>%
-  select(master_deal_no, period, mkt_corr, acq_corr) %>%
-  pivot_wider(names_from = period, values_from = c(mkt_corr, acq_corr)) %>%
+ff_raw <- dbGetQuery(wrds, ff_query) %>%
   mutate(
-    delta_mkt = `mkt_corr_Just After (0 to 60)` - `mkt_corr_Just Before (-60 to -1)`,
-    delta_acq = `acq_corr_Just After (0 to 60)` - `acq_corr_Just Before (-60 to -1)`
+    date  = as.Date(date),
+    mktrf = as.numeric(mktrf),
+    rf    = as.numeric(rf)
   )
 
-cat("\n\nCash Deal Changes (Just Before → Just After):\n")
-cat(sprintf("  Market correlation: %.3f (t=%.2f, p=%.4f)\n",
-            mean(cash_change$delta_mkt, na.rm = TRUE),
-            t.test(cash_change$delta_mkt)$statistic,
-            t.test(cash_change$delta_mkt)$p.value))
-cat(sprintf("  Acquirer correlation: %.3f (t=%.2f, p=%.4f)\n\n",
-            mean(cash_change$delta_acq, na.rm = TRUE),
-            t.test(cash_change$delta_acq)$statistic,
-            t.test(cash_change$delta_acq)$p.value))
+# ---- Factor scaling sanity check ----
+# On WRDS, ff.factors_daily is typically in percent units (e.g., 0.12 = 0.12%).
+# We detect and scale accordingly.
+mktrf_med_abs <- median(abs(ff_raw$mktrf), na.rm = TRUE)
+rf_med_abs    <- median(abs(ff_raw$rf), na.rm = TRUE)
 
+scale_is_percent <- (mktrf_med_abs > 0.005 | rf_med_abs > 0.002) # heuristic
+scale_factor <- if (scale_is_percent) 100 else 1
+
+ff_daily <- ff_raw %>%
+  mutate(
+    mktrf = mktrf / scale_factor,
+    rf    = rf    / scale_factor
+  )
+
+cat(sprintf("FF scaling detected as %s; dividing by %d.\n\n",
+            ifelse(scale_is_percent, "PERCENT units", "DECIMAL units"), scale_factor))
+
+# ----------------------------
+# 19.3 Build deal-day panel with both target and acquirer returns
+# ----------------------------
+# Target return rows
+target_daily <- crsp_daily %>%
+  inner_join(
+    deals_for_risk %>%
+      select(master_deal_no, target_permno, acquirer_permno, dateann, dateeff,
+             start_date, end_date, deal_type, deal_value),
+    by = c("permno" = "target_permno")
+  ) %>%
+  filter(date >= start_date, date <= end_date) %>%
+  rename(target_ret = ret) %>%
+  select(master_deal_no, date, target_ret, acquirer_permno,
+         dateann, dateeff, deal_type, deal_value)
+
+# Acquirer return rows keyed to deal
+acquirer_daily <- crsp_daily %>%
+  inner_join(
+    deals_for_risk %>%
+      select(master_deal_no, acquirer_permno) %>%
+      distinct(),
+    by = c("permno" = "acquirer_permno")
+  ) %>%
+  rename(acquirer_ret = ret) %>%
+  select(master_deal_no, date, acquirer_ret)
+
+# Combine + add FF
+deal_daily <- target_daily %>%
+  left_join(acquirer_daily, by = c("master_deal_no", "date")) %>%
+  inner_join(ff_daily, by = "date") %>%
+  mutate(
+    days_rel   = as.integer(date - dateann),
+    targ_excess = target_ret - rf
+  )
+
+# ----------------------------
+# 19.4 Helper: compute window metrics within a deal
+# ----------------------------
+compute_window_metrics <- function(df) {
+  # Requires columns: target_ret, targ_excess, mktrf, acquirer_ret
+  ok_mkt <- !is.na(df$targ_excess) & !is.na(df$mktrf)
+  ok_cor <- !is.na(df$targ_excess) & !is.na(df$mktrf)
+  ok_acq <- !is.na(df$target_ret)  & !is.na(df$acquirer_ret)
+
+  n_mkt <- sum(ok_mkt)
+  n_acq <- sum(ok_acq)
+
+  mkt_beta <- if (n_mkt >= 30) {
+    cov(df$targ_excess[ok_mkt], df$mktrf[ok_mkt]) / var(df$mktrf[ok_mkt])
+  } else NA_real_
+
+  mkt_corr <- if (sum(ok_cor) >= 30) {
+    cor(df$targ_excess[ok_cor], df$mktrf[ok_cor])
+  } else NA_real_
+
+  acq_corr <- if (n_acq >= 30) {
+    cor(df$target_ret[ok_acq], df$acquirer_ret[ok_acq])
+  } else NA_real_
+
+  # Idiosyncratic vol: SD of residuals from market model on excess returns
+  idio_vol <- if (n_mkt >= 30) {
+    fit <- lm(df$targ_excess[ok_mkt] ~ df$mktrf[ok_mkt])
+    sd(resid(fit), na.rm = TRUE)
+  } else NA_real_
+
+  tibble(
+    n_mkt = n_mkt,
+    n_acq = n_acq,
+    mkt_beta = mkt_beta,
+    mkt_corr = mkt_corr,
+    acq_corr = acq_corr,
+    idio_vol = idio_vol
+  )
+}
+
+# ----------------------------
+# 19.5 Compute Just Before / Just After metrics per deal
+# ----------------------------
+risk_by_window <- deal_daily %>%
+  mutate(
+    window = case_when(
+      days_rel >= -60 & days_rel <= -1  ~ "Just Before (-60 to -1)",
+      days_rel >= 0   & days_rel <= 60  ~ "Just After (0 to 60)",
+      TRUE ~ NA_character_
+    )
+  ) %>%
+  filter(!is.na(window)) %>%
+  group_by(master_deal_no, deal_type, window) %>%
+  group_modify(~ compute_window_metrics(.x)) %>%
+  ungroup() %>%
+  # Require enough data in each window
+  filter(n_mkt >= 30, n_acq >= 30)
+
+# ----------------------------
+# 19.6 Build table with before/after + deltas and t-tests (within type)
+# ----------------------------
+risk_wide <- risk_by_window %>%
+  select(master_deal_no, deal_type, window, mkt_corr, mkt_beta, acq_corr, idio_vol) %>%
+  pivot_wider(names_from = window, values_from = c(mkt_corr, mkt_beta, acq_corr, idio_vol))
+
+# Deal-level deltas
+risk_deltas <- risk_wide %>%
+  mutate(
+    d_mkt_corr = `mkt_corr_Just After (0 to 60)` - `mkt_corr_Just Before (-60 to -1)`,
+    d_mkt_beta = `mkt_beta_Just After (0 to 60)` - `mkt_beta_Just Before (-60 to -1)`,
+    d_acq_corr = `acq_corr_Just After (0 to 60)` - `acq_corr_Just Before (-60 to -1)`,
+    d_idio_vol = `idio_vol_Just After (0 to 60)` - `idio_vol_Just Before (-60 to -1)`
+  )
+
+# Summary by deal type (levels + change)
+risk_summary <- risk_deltas %>%
+  group_by(deal_type) %>%
+  summarise(
+    N = n(),
+
+    mkt_corr_before = mean(`mkt_corr_Just Before (-60 to -1)`, na.rm = TRUE),
+    mkt_corr_after  = mean(`mkt_corr_Just After (0 to 60)`, na.rm = TRUE),
+    mkt_corr_delta  = mean(d_mkt_corr, na.rm = TRUE),
+
+    mkt_beta_before = mean(`mkt_beta_Just Before (-60 to -1)`, na.rm = TRUE),
+    mkt_beta_after  = mean(`mkt_beta_Just After (0 to 60)`, na.rm = TRUE),
+    mkt_beta_delta  = mean(d_mkt_beta, na.rm = TRUE),
+
+    acq_corr_before = mean(`acq_corr_Just Before (-60 to -1)`, na.rm = TRUE),
+    acq_corr_after  = mean(`acq_corr_Just After (0 to 60)`, na.rm = TRUE),
+    acq_corr_delta  = mean(d_acq_corr, na.rm = TRUE),
+
+    idio_before     = mean(`idio_vol_Just Before (-60 to -1)`, na.rm = TRUE),
+    idio_after      = mean(`idio_vol_Just After (0 to 60)`, na.rm = TRUE),
+    idio_delta      = mean(d_idio_vol, na.rm = TRUE),
+
+    # within-type t-tests of delta != 0 (match your note)
+    p_mkt_corr = tryCatch(t.test(d_mkt_corr)$p.value, error = function(e) NA_real_),
+    p_mkt_beta = tryCatch(t.test(d_mkt_beta)$p.value, error = function(e) NA_real_),
+    p_acq_corr = tryCatch(t.test(d_acq_corr)$p.value, error = function(e) NA_real_),
+    p_idio_vol = tryCatch(t.test(d_idio_vol)$p.value, error = function(e) NA_real_),
+
+    .groups = "drop"
+  )
+
+print(risk_summary, digits = 3)
+
+# Optional: cash vs stock delta differences (for your note)
+cash_vs_stock <- risk_deltas %>%
+  filter(deal_type %in% c("All Cash", "All Stock")) %>%
+  group_by(deal_type) %>%
+  summarise(
+    N = n(),
+    d_mkt_corr = mean(d_mkt_corr, na.rm = TRUE),
+    d_mkt_beta = mean(d_mkt_beta, na.rm = TRUE),
+    d_acq_corr = mean(d_acq_corr, na.rm = TRUE),
+    d_idio_vol = mean(d_idio_vol, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+cat("\nCash vs Stock (mean deltas):\n")
+print(cash_vs_stock, digits = 3)
+
+cat("\nCash-Stock delta tests:\n")
+tmp <- risk_deltas %>% filter(deal_type %in% c("All Cash","All Stock"))
+for (v in c("d_mkt_corr","d_mkt_beta","d_acq_corr","d_idio_vol")) {
+  tt <- tryCatch(t.test(tmp[[v]] ~ tmp$deal_type), error = function(e) NULL)
+  if (!is.null(tt)) {
+    cat(sprintf("  %s: diff=%.4f, p=%.4g\n",
+                v, diff(rev(tt$estimate)), tt$p.value))
+  }
+}
+
+# ----------------------------
+# 19.7 Save results
+# ----------------------------
 saveRDS(list(
-  daily = risk_metrics,
-  summary = transformation_table,
-  changes = cash_change
+  deals_for_risk = deals_for_risk,
+  deal_daily     = deal_daily,
+  risk_by_window = risk_by_window,
+  risk_deltas    = risk_deltas,
+  risk_summary   = risk_summary
 ), "risk_transformation_results.rds")
+
+cat("\nSaved: risk_transformation_results.rds\n")
 
 #===========================================================================================
 # STEP 20: Cross-Deal Arbitrage - Target/Acquirer Cross-Holdings in Stock Deals
