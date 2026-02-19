@@ -1934,114 +1934,651 @@ cat(sprintf("Entry volume (shares):   %.3f\n\n", gini_volume))
 # ---- clean up ----------------------------------------------------------------------------------
 rm("entrants_with_volume", "inst_breadth")
 
-#=================================================================================================
-# STEP 15: Velocity Analysis - Institutional Trading Speed
-# Input:  deals_panel, deals_with_io, target_panel
-# Output: Daily velocity estimates, model selection, predictions at key horizons
-#=================================================================================================
+#==================================================================================================
+# STEP 15 (END-TO-END, CORRECTED): Velocity Analysis — Institutional Trading Speed (Cash Deals)
+# Requires: mgcv, gratia, dplyr, tidyr, purrr, ggplot2
+#
+# Inputs expected in env:
+#   deals_panel: master_deal_no, permno, t_0, deal_type, exit_pct, entry_pct, net_change_pct
+#   deals_with_io: master_deal_no, target_permno, dateann
+#
+# Outputs:
+#   figures_step15/*.pdf and *.png
+#   figures_step15/velocity_results_step15.rds
+#
+# Notes:
+#   - No hard n_deals cutoffs: we keep all bins and downweight via precision weights + shrinkage.
+#   - Derivatives/SE are computed via gratia::derivatives(data=...) and standardized to dfit/dse.
+#==================================================================================================
 
-# ---- data structure analysis -------------------------------------------------------------------
-timing_data <- deals_panel %>%
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(tidyr)
+  library(purrr)
+  library(ggplot2)
+  library(mgcv)
+  library(splines)
+  library(gratia)
+  library(conflicted)
+})
+
+conflicts_prefer(dplyr::filter)
+conflicts_prefer(dplyr::lag)
+conflicts_prefer(dplyr::first)
+
+#-----------------------------#
+# 0) CONFIG
+#-----------------------------#
+cfg <- list(
+  deal_type_pattern = "Cash",
+  min_days = 1,
+  max_days = 90,
+  week_width = 7,
+
+  figures_dir = "figures_step15",
+  export_dpi = 450,
+  theme_base = 13,
+
+  grid_days = 1:90,
+  grid_week_mid = 1:90,
+
+  # Completion rules
+  completion_L = 14,        # derivative CI includes 0 for L consecutive days
+  completion_frac = 0.95,   # level reaches 95% of day-90 value
+
+  # Model settings
+  gam_k_weekly = 6,
+  gam_k_deal = 10,
+
+  run = list(
+    weekly_wls = TRUE,
+    weekly_gam = TRUE,
+    deal_level_gam = TRUE,
+    isotonic = TRUE,
+    scam_monotone = FALSE
+  ),
+
+  # Plot method sets
+  show_methods_all = c("Weekly GAM (REML)", "Weekly WLS (best)", "Deal-level GAM (REML)", "Isotonic (monotone)"),
+  paper_methods = c("Weekly GAM (REML)", "Deal-level GAM (REML)", "Isotonic (monotone)")
+)
+
+dir.create(cfg$figures_dir, showWarnings = FALSE, recursive = TRUE)
+
+#-----------------------------#
+# 1) DATA PREP
+#-----------------------------#
+timing_data_raw <- deals_panel %>%
   left_join(
     deals_with_io %>% select(master_deal_no, target_permno, dateann),
     by = c("master_deal_no", "permno" = "target_permno")
   ) %>%
   filter(!is.na(dateann), !is.na(t_0)) %>%
+  mutate(days_to_qtr_end = as.numeric(t_0 - dateann)) %>%
+  filter(days_to_qtr_end >= cfg$min_days, days_to_qtr_end <= cfg$max_days) %>%
+  filter(grepl(cfg$deal_type_pattern, deal_type, ignore.case = TRUE)) %>%
   mutate(
-    days_to_qtr_end = as.numeric(t_0 - dateann)
-  ) %>%
-  filter(days_to_qtr_end >= 1, days_to_qtr_end <= 90)
-
-# ---- decomposition ------------------------------------------------------------------------------
-weekly_flows_cash <- timing_data %>%
-  filter(grepl("Cash", deal_type, ignore.case = TRUE)) %>%  # Flexible matching
-  mutate(week = floor(days_to_qtr_end / 7) + 1) %>%
-  group_by(week) %>%
-  summarise(
-    N = n(),
-    Days_Mid = mean(days_to_qtr_end),
-    Exit = mean(exit_pct),
-    Entry = mean(entry_pct),
-    Net = mean(net_change_pct),
-    Stayer = Net - Entry + Exit,
-    .groups = "drop"
+    week = floor((days_to_qtr_end - 1) / cfg$week_width) + 1,
+    week_mid = (week - 0.5) * cfg$week_width
   )
 
-print(weekly_flows_cash, digits = 1)
+stopifnot(nrow(timing_data_raw) > 0)
 
-# ---- Three-bucket decomposition (all deal types) -------------------------------------------------
-coarse_decomp <- timing_data %>%
-  mutate(
-    bucket = case_when(
-      days_to_qtr_end <= 30 ~ "Early (1-30d)",
-      days_to_qtr_end <= 60 ~ "Middle (31-60d)",
-      TRUE ~ "Late (61-90d)"
-    ),
-    bucket = factor(bucket, levels = c("Early (1-30d)", "Middle (31-60d)", "Late (61-90d)"))
+timing_long <- timing_data_raw %>%
+  select(master_deal_no, permno, deal_type, dateann, t_0, days_to_qtr_end, week, week_mid,
+         exit_pct, entry_pct, net_change_pct) %>%
+  pivot_longer(
+    cols = c(exit_pct, entry_pct, net_change_pct),
+    names_to = "component_raw",
+    values_to = "value"
   ) %>%
-  group_by(deal_type, bucket) %>%
+  mutate(
+    component = recode(component_raw,
+                       exit_pct = "Exit",
+                       entry_pct = "Entry",
+                       net_change_pct = "Net"),
+    component = factor(component, levels = c("Exit", "Entry", "Net"))
+  )
+
+#-----------------------------#
+# 2) WEEKLY AGGREGATION (NO CUT-OFFS)
+#-----------------------------#
+stabilized_invvar <- function(se, floor_quantile = 0.10) {
+  ok <- is.finite(se) & se > 0
+  if (!any(ok)) return(rep(1, length(se)))
+  se_floor <- as.numeric(stats::quantile(se[ok], probs = floor_quantile, na.rm = TRUE))
+  se_adj <- pmax(se, se_floor)
+  1 / (se_adj^2)
+}
+
+weekly_agg <- timing_long %>%
+  group_by(component, week, week_mid) %>%
+  summarise(
+    n = sum(!is.na(value)),
+    mean = mean(value, na.rm = TRUE),
+    sd = sd(value, na.rm = TRUE),
+    se = sd / sqrt(pmax(n, 1)),
+    median = median(value, na.rm = TRUE),
+    q25 = quantile(value, 0.25, na.rm = TRUE, names = FALSE),
+    q75 = quantile(value, 0.75, na.rm = TRUE, names = FALSE),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    w_invvar = stabilized_invvar(se),
+    w_n = pmax(n, 1)
+  )
+
+support_week <- timing_data_raw %>%
+  group_by(week, week_mid) %>%
+  summarise(n_obs = n(), .groups = "drop")
+
+#-----------------------------#
+# 3) MODELS
+#-----------------------------#
+fit_weekly_wls <- function(df, y = "mean", x = "week_mid", w = "w_invvar") {
+  d <- df %>% filter(is.finite(.data[[y]]), is.finite(.data[[x]]), is.finite(.data[[w]]))
+  wvec <- d[[w]]
+
+  models <- list(
+    linear = lm(reformulate(x, y), data = d, weights = wvec),
+    quad   = lm(reformulate(sprintf("poly(%s,2)", x), y), data = d, weights = wvec),
+    ns3    = lm(reformulate(sprintf("splines::ns(%s, df=3)", x), y), data = d, weights = wvec),
+    ns4    = lm(reformulate(sprintf("splines::ns(%s, df=4)", x), y), data = d, weights = wvec)
+  )
+
+  comp <- tibble(model = names(models)) %>%
+    mutate(
+      aic = map_dbl(model, ~AIC(models[[.x]])),
+      r2  = map_dbl(model, ~summary(models[[.x]])$r.squared)
+    ) %>%
+    arrange(aic) %>%
+    mutate(delta_aic = aic - min(aic))
+
+  best <- comp$model[1]
+  list(models = models, comp = comp, best = best, best_model = models[[best]])
+}
+
+fit_weekly_gam <- function(df, y = "mean", x = "week_mid", w = "w_invvar", k = 6) {
+  d <- df %>% filter(is.finite(.data[[y]]), is.finite(.data[[x]]), is.finite(.data[[w]]))
+  wvec <- d[[w]]
+  gam(
+    reformulate(sprintf("s(%s, bs='ts', k=%d)", x, k), y),
+    data = d, weights = wvec, method = "REML"
+  )
+}
+
+fit_deal_level_gam <- function(df_long, component_name, k = 10) {
+  d <- df_long %>%
+    filter(component == component_name) %>%
+    filter(is.finite(value), is.finite(days_to_qtr_end))
+  gam(
+    value ~ s(days_to_qtr_end, bs = "ts", k = k),
+    data = d, method = "REML"
+  )
+}
+
+fit_isotonic_weekly <- function(df, y = "mean", x = "week_mid", w = "w_n", increasing = TRUE) {
+  d <- df %>%
+    filter(is.finite(.data[[y]]), is.finite(.data[[x]]), is.finite(.data[[w]])) %>%
+    arrange(.data[[x]])
+
+  cap <- 25
+  reps <- pmin(cap, pmax(1, round(d[[w]] / median(d[[w]], na.rm = TRUE))))
+  x_rep <- rep(d[[x]], reps)
+  y_rep <- rep(d[[y]], reps)
+
+  iso <- stats::isoreg(x_rep, if (increasing) y_rep else -y_rep)
+  pred_fun <- stats::approxfun(iso$x, iso$yf, rule = 2)
+
+  list(
+    data = d,
+    iso = iso,
+    pred_fun = function(xnew) if (increasing) pred_fun(xnew) else -pred_fun(xnew)
+  )
+}
+
+fit_scam_monotone <- function(df, y = "mean", x = "week_mid", w = "w_invvar", k = 6) {
+  if (!requireNamespace("scam", quietly = TRUE)) return(NULL)
+  d <- df %>% filter(is.finite(.data[[y]]), is.finite(.data[[x]]), is.finite(.data[[w]]))
+  wvec <- d[[w]]
+  scam::scam(
+    reformulate(sprintf("s(%s, bs='mpi', k=%d)", x, k), y),
+    data = d, weights = wvec
+  )
+}
+
+components <- levels(weekly_agg$component)
+
+fits <- map(components, function(comp) {
+  dfw <- weekly_agg %>% filter(component == comp)
+  out <- list()
+
+  if (cfg$run$weekly_wls) out$weekly_wls <- fit_weekly_wls(dfw)
+  if (cfg$run$weekly_gam) out$weekly_gam <- fit_weekly_gam(dfw, k = cfg$gam_k_weekly)
+  if (cfg$run$deal_level_gam) out$deal_level_gam <- fit_deal_level_gam(timing_long, comp, k = cfg$gam_k_deal)
+
+  if (cfg$run$isotonic && comp %in% c("Exit","Entry")) out$isotonic <- fit_isotonic_weekly(dfw, increasing = TRUE)
+  if (cfg$run$scam_monotone && comp %in% c("Exit","Entry")) out$scam <- fit_scam_monotone(dfw, k = cfg$gam_k_weekly)
+
+  out
+})
+names(fits) <- components
+
+#-----------------------------#
+# 4) PREDICTIONS (LEVELS)
+#-----------------------------#
+predict_lm <- function(model, xnew, xname) {
+  nd <- tibble(!!xname := xnew)
+  p <- predict(model, newdata = nd, se.fit = TRUE)
+  tibble(x = xnew, fit = as.numeric(p$fit), se = as.numeric(p$se.fit))
+}
+
+predict_gam <- function(model, xnew, xname) {
+  nd <- tibble(!!xname := xnew)
+  p <- predict(model, newdata = nd, se.fit = TRUE)
+  tibble(x = xnew, fit = as.numeric(p$fit), se = as.numeric(p$se.fit))
+}
+
+grid_week <- cfg$grid_week_mid
+grid_days <- cfg$grid_days
+
+preds_df <- map_dfr(components, function(comp) {
+  out <- list()
+
+  if (!is.null(fits[[comp]]$weekly_wls)) {
+    out$wls <- predict_lm(fits[[comp]]$weekly_wls$best_model, grid_week, "week_mid") %>%
+      mutate(method = "Weekly WLS (best)")
+  }
+  if (!is.null(fits[[comp]]$weekly_gam)) {
+    out$wg <- predict_gam(fits[[comp]]$weekly_gam, grid_week, "week_mid") %>%
+      mutate(method = "Weekly GAM (REML)")
+  }
+  if (!is.null(fits[[comp]]$deal_level_gam)) {
+    out$dg <- predict_gam(fits[[comp]]$deal_level_gam, grid_days, "days_to_qtr_end") %>%
+      mutate(method = "Deal-level GAM (REML)")
+  }
+  if (!is.null(fits[[comp]]$isotonic)) {
+    f <- fits[[comp]]$isotonic$pred_fun
+    out$iso <- tibble(x = grid_week, fit = f(grid_week), se = NA_real_, method = "Isotonic (monotone)")
+  }
+  if (!is.null(fits[[comp]]$scam)) {
+    out$scam <- predict_gam(fits[[comp]]$scam, grid_week, "week_mid") %>%
+      mutate(method = "SCAM monotone")
+  }
+
+  bind_rows(out) %>% mutate(component = as.character(comp))
+})
+
+weekly_points <- weekly_agg %>%
+  mutate(component = as.character(component)) %>%
+  transmute(component, method = "Weekly means", x = week_mid, fit = mean, n = n, se = se, q25 = q25, q75 = q75)
+
+#-----------------------------#
+# 5) DERIVATIVES (VELOCITY) USING GRATIA — UPDATED API + ROBUST RENAMING
+#-----------------------------#
+# gratia::derivatives() now prefers `data=`. We standardize output to:
+#   x, dfit, dse, component, method
+
+standardize_deriv <- function(d, xvec, method_label, component_label) {
+  # gratia derivatives commonly returns: derivative, se, lower, upper (names can vary)
+  # We'll map defensively.
+  dfit <- d[["derivative"]]
+  if (is.null(dfit)) dfit <- d[[".derivative"]]  # fallback (rare)
+  dse <- d[["se"]]
+  if (is.null(dse)) dse <- d[[".se"]]           # fallback (rare)
+
+  # If still missing, return empty tibble (prevents downstream failure)
+  if (is.null(dfit) || is.null(dse)) {
+    return(tibble())
+  }
+
+  tibble(
+    x = xvec,
+    dfit = as.numeric(dfit),
+    dse  = as.numeric(dse),
+    method = method_label,
+    component = component_label
+  )
+}
+
+get_deriv_safe <- function(model, term, data_grid, xcol, method_label, component_label) {
+  if (is.null(model)) return(tibble())
+  # catch errors (e.g., term name mismatch)
+  d <- try(gratia::derivatives(model, term = term, data = data_grid), silent = TRUE)
+  if (inherits(d, "try-error")) return(tibble())
+  standardize_deriv(d, xvec = data_grid[[xcol]], method_label, component_label)
+}
+
+grid_w <- tibble(week_mid = grid_week)
+grid_d <- tibble(days_to_qtr_end = grid_days)
+
+derivs_df <- bind_rows(
+  map_dfr(components, function(comp) {
+    get_deriv_safe(
+      model = fits[[comp]]$weekly_gam,
+      term = "s(week_mid)",
+      data_grid = grid_w,
+      xcol = "week_mid",
+      method_label = "Weekly GAM (REML)",
+      component_label = as.character(comp)
+    )
+  }),
+  map_dfr(components, function(comp) {
+    get_deriv_safe(
+      model = fits[[comp]]$deal_level_gam,
+      term = "s(days_to_qtr_end)",
+      data_grid = grid_d,
+      xcol = "days_to_qtr_end",
+      method_label = "Deal-level GAM (REML)",
+      component_label = as.character(comp)
+    )
+  }),
+  map_dfr(c("Exit","Entry"), function(comp) {
+    get_deriv_safe(
+      model = fits[[comp]]$scam,
+      term = "s(week_mid)",
+      data_grid = grid_w,
+      xcol = "week_mid",
+      method_label = "SCAM monotone",
+      component_label = comp
+    )
+  })
+)
+
+#-----------------------------#
+# 6) COMPLETION RULES
+#-----------------------------#
+completion_day_deriv <- function(x, dfit, dse, L = 14) {
+  n <- length(x)
+  if (n < L) return(NA_real_)
+  inside <- (dfit - 1.96*dse <= 0) & (dfit + 1.96*dse >= 0)
+  inside[is.na(inside)] <- FALSE
+  r <- rle(inside)
+  ends <- cumsum(r$lengths)
+  starts <- ends - r$lengths + 1
+  idx <- which(r$values & r$lengths >= L)
+  if (length(idx) == 0) return(NA_real_)
+  x[starts[idx[1]]]
+}
+
+completion_day_level <- function(x, fit, frac = 0.95) {
+  if (length(x) == 0) return(NA_real_)
+  target <- frac * fit[which.max(x)]
+  idx <- which(fit >= target)
+  if (length(idx) == 0) return(NA_real_)
+  x[min(idx)]
+}
+
+completion_tbl_deriv <- derivs_df %>%
+  filter(component %in% c("Exit","Entry")) %>%
+  group_by(component, method) %>%
+  summarise(completion_day = completion_day_deriv(x, dfit, dse, L = cfg$completion_L),
+            .groups = "drop") %>%
+  arrange(component, completion_day)
+
+completion_tbl_level <- preds_df %>%
+  filter(component %in% c("Exit","Entry")) %>%
+  group_by(component, method) %>%
+  summarise(completion_day = completion_day_level(x, fit, frac = cfg$completion_frac),
+            .groups = "drop") %>%
+  arrange(component, completion_day)
+
+#-----------------------------#
+# 7) THEMES + SAVE HELPERS
+#-----------------------------#
+theme_pub <- theme_minimal(base_size = cfg$theme_base) +
+  theme(
+    panel.grid.minor = element_blank(),
+    plot.title = element_text(face = "bold"),
+    strip.text = element_text(face = "bold"),
+    legend.title = element_blank()
+  )
+
+save_plot <- function(name, p, w, h) {
+  ggsave(file.path(cfg$figures_dir, paste0(name, ".pdf")), p, width = w, height = h)
+  ggsave(file.path(cfg$figures_dir, paste0(name, ".png")), p, width = w, height = h, dpi = cfg$export_dpi)
+}
+
+#-----------------------------#
+# 8) VISUALS (LOTS OF ANGLES)
+#-----------------------------#
+
+# 8.1 Support by week
+p_support <- ggplot(support_week, aes(x = week_mid, y = n_obs)) +
+  geom_col() +
+  labs(title = "Support Across Announcement→Quarter-End Window (Cash Deals)",
+       x = "Days from announcement to quarter-end (weekly bins)",
+       y = "Deal-observations per bin") +
+  theme_pub
+save_plot("01_support_by_week", p_support, 8.2, 3.2)
+
+# 8.2 Weekly means + IQR (distribution view)
+p_weekly_iqr <- weekly_points %>%
+  ggplot(aes(x = x, y = fit)) +
+  geom_linerange(aes(ymin = q25, ymax = q75), alpha = 0.4) +
+  geom_point(aes(size = n), alpha = 0.7) +
+  facet_wrap(~component, scales = "free_y", ncol = 1) +
+  scale_size_continuous(range = c(1.2, 6.5)) +
+  labs(title = "Weekly Means with Within-Bin IQR (No Bins Dropped)",
+       x = "Days", y = "Weekly mean (IQR bars; point size ∝ n)") +
+  theme_pub +
+  theme(legend.position = "bottom")
+save_plot("02_weekly_means_iqr", p_weekly_iqr, 8.2, 7.8)
+
+# 8.3 Method overlays for all components
+p_methods_all <- ggplot() +
+  geom_ribbon(
+    data = preds_df %>% filter(method %in% cfg$show_methods_all, is.finite(se)),
+    aes(x = x, ymin = fit - 1.96*se, ymax = fit + 1.96*se, group = method),
+    alpha = 0.10
+  ) +
+  geom_line(
+    data = preds_df %>% filter(method %in% cfg$show_methods_all),
+    aes(x = x, y = fit, linetype = method),
+    linewidth = 1.05
+  ) +
+  geom_point(
+    data = weekly_points,
+    aes(x = x, y = fit, size = n),
+    alpha = 0.55
+  ) +
+  facet_wrap(~component, scales = "free_y", ncol = 1) +
+  scale_size_continuous(range = c(1.2, 6.5)) +
+  labs(title = "Cumulative Flow Curves: Multiple Estimators (No Cutoffs)",
+       x = "Days", y = "Cumulative flow",
+       caption = "Points = weekly means. Ribbons = 95% CI where available.") +
+  theme_pub +
+  theme(legend.position = "bottom")
+save_plot("03_methods_overlay_all_components", p_methods_all, 8.6, 9.5)
+
+# 8.4 Two clocks (paper-ready): Entry vs Exit + 95% completion lines (level-based)
+two_df <- preds_df %>%
+  filter(component %in% c("Exit","Entry"),
+         method %in% cfg$paper_methods)
+
+two_pts <- weekly_points %>% filter(component %in% c("Exit","Entry"))
+
+lines_level <- completion_tbl_level %>%
+  filter(component %in% c("Exit","Entry"), method %in% cfg$paper_methods) %>%
+  filter(is.finite(completion_day))
+
+p_two_clocks <- ggplot() +
+  geom_ribbon(
+    data = two_df %>% filter(is.finite(se)),
+    aes(x = x, ymin = fit - 1.96*se, ymax = fit + 1.96*se, group = method),
+    alpha = 0.10
+  ) +
+  geom_line(
+    data = two_df,
+    aes(x = x, y = fit, linetype = method),
+    linewidth = 1.15
+  ) +
+  geom_point(
+    data = two_pts,
+    aes(x = x, y = fit, size = n),
+    alpha = 0.55
+  ) +
+  geom_vline(
+    data = lines_level,
+    aes(xintercept = completion_day),
+    linetype = "dashed", linewidth = 0.5
+  ) +
+  facet_wrap(~component, scales = "free_y", ncol = 1) +
+  scale_size_continuous(range = c(1.2, 6.5)) +
+  labs(
+    title = "Two Clocks: Entry Completes Before Exit",
+    subtitle = sprintf("Dashed line = day reaching %.0f%% of day-90 level (method-specific)",
+                       100 * cfg$completion_frac),
+    x = "Days", y = "Cumulative flow (% of TSO)"
+  ) +
+  theme_pub +
+  theme(legend.position = "bottom")
+save_plot("04_two_clocks_paper", p_two_clocks, 8.2, 7.6)
+
+# 8.5 Velocity (derivatives) with correct SE via gratia
+# If derivs_df is empty, plot will be empty but won’t error.
+p_deriv <- derivs_df %>%
+  filter(method %in% c("Weekly GAM (REML)", "Deal-level GAM (REML)", "SCAM monotone")) %>%
+  ggplot(aes(x = x, y = dfit, linetype = method)) +
+  geom_hline(yintercept = 0, linewidth = 0.4) +
+  geom_ribbon(
+    aes(ymin = dfit - 1.96*dse, ymax = dfit + 1.96*dse, group = method),
+    alpha = 0.10
+  ) +
+  geom_line(linewidth = 1.05) +
+  facet_wrap(~component, scales = "free_y", ncol = 1) +
+  labs(
+    title = "Velocity (Derivative of Smooth) with Correct Uncertainty",
+    subtitle = sprintf("Derivative SE from gratia::derivatives(data=...); completion uses %d consecutive days CI includes 0",
+                       cfg$completion_L),
+    x = "Days", y = "Daily velocity (approx.)"
+  ) +
+  theme_pub +
+  theme(legend.position = "bottom")
+save_plot("05_velocity_derivatives_gratia", p_deriv, 8.6, 9.0)
+
+# 8.6 Completion diagnostic (derivative-based) for Exit/Entry only
+lines_deriv <- completion_tbl_deriv %>%
+  filter(method %in% c("Weekly GAM (REML)", "Deal-level GAM (REML)", "SCAM monotone")) %>%
+  filter(is.finite(completion_day))
+
+p_deriv_exit_entry <- derivs_df %>%
+  filter(component %in% c("Exit","Entry"),
+         method %in% c("Weekly GAM (REML)", "Deal-level GAM (REML)", "SCAM monotone")) %>%
+  ggplot(aes(x = x, y = dfit, linetype = method)) +
+  geom_hline(yintercept = 0, linewidth = 0.4) +
+  geom_ribbon(aes(ymin = dfit - 1.96*dse, ymax = dfit + 1.96*dse, group = method),
+              alpha = 0.10) +
+  geom_line(linewidth = 1.05) +
+  geom_vline(data = lines_deriv, aes(xintercept = completion_day),
+             linetype = "dashed", linewidth = 0.5) +
+  facet_wrap(~component, scales = "free_y", ncol = 1) +
+  labs(
+    title = "Derivative-Based Completion Days (Exit/Entry)",
+    subtitle = sprintf("Dashed line = first day CI includes 0 for %d consecutive days", cfg$completion_L),
+    x = "Days", y = "Velocity"
+  ) +
+  theme_pub +
+  theme(legend.position = "bottom")
+save_plot("06_velocity_completion_derivative", p_deriv_exit_entry, 8.2, 7.2)
+
+# 8.7 ECDF by phase (distribution check)
+timing_data <- timing_data_raw %>%
+  mutate(
+    phase = case_when(
+      days_to_qtr_end <= 30 ~ "Early (1–30)",
+      days_to_qtr_end <= 60 ~ "Middle (31–60)",
+      TRUE ~ "Late (61–90)"
+    ),
+    phase = factor(phase, levels = c("Early (1–30)", "Middle (31–60)", "Late (61–90)"))
+  )
+
+ecdf_long <- timing_data %>%
+  select(days_to_qtr_end, phase, exit_pct, entry_pct, net_change_pct) %>%
+  pivot_longer(cols = c(exit_pct, entry_pct, net_change_pct),
+               names_to = "component_raw", values_to = "value") %>%
+  mutate(component = recode(component_raw,
+                            exit_pct="Exit", entry_pct="Entry", net_change_pct="Net"))
+
+p_ecdf <- ecdf_long %>%
+  filter(component %in% c("Exit","Entry")) %>%
+  ggplot(aes(x = value, color = phase)) +
+  stat_ecdf(geom = "step", linewidth = 1.0) +
+  facet_wrap(~component, scales = "free_x", ncol = 1) +
+  labs(
+    title = "Distribution of Deal-Level Flows by Phase (ECDF)",
+    subtitle = "Checks whether the story is broad-based or tail-driven",
+    x = "Flow (% of TSO)", y = "ECDF"
+  ) +
+  theme_pub +
+  theme(legend.position = "bottom")
+save_plot("07_ecdf_by_phase_exit_entry", p_ecdf, 8.2, 7.2)
+
+# 8.8 Phase decomposition + difference tests (clean)
+coarse_decomp <- timing_data %>%
+  group_by(phase) %>%
   summarise(
     N = n(),
     Mean_Days = mean(days_to_qtr_end),
-    
-    # COMPONENTS (% of TSO)
-    Exit_Mean = mean(exit_pct),
-    Exit_Median = median(exit_pct),
-    Entry_Mean = mean(entry_pct),
-    Entry_Median = median(entry_pct),
-    Stayer_Mean = mean(net_change_pct) - mean(entry_pct) + mean(exit_pct),
-    
-    # NET CHANGE (pp)
-    Net_Mean = mean(net_change_pct),
-    Net_Median = median(net_change_pct),
-    
-    # GROSS ACTIVITY
+    Exit_Mean = mean(exit_pct, na.rm=TRUE),
+    Entry_Mean = mean(entry_pct, na.rm=TRUE),
+    Stayer_Mean = mean(net_change_pct, na.rm=TRUE) - mean(entry_pct, na.rm=TRUE) + mean(exit_pct, na.rm=TRUE),
+    Net_Mean = mean(net_change_pct, na.rm=TRUE),
     Gross_Turnover = abs(Exit_Mean) + abs(Entry_Mean) + abs(Stayer_Mean),
-    
     .groups = "drop"
   )
 
-print(coarse_decomp, digits = 1, width = Inf)
+early <- timing_data %>% filter(phase == "Early (1–30)")
+middle <- timing_data %>% filter(phase == "Middle (31–60)")
+late <- timing_data %>% filter(phase == "Late (61–90)")
 
-# ---- Cash only ----------------------------------------------------------------------------------
-cash_coarse <- coarse_decomp %>% 
-  filter(deal_type == "Cash") %>%
-  select(bucket, N, Mean_Days, Exit_Mean, Entry_Mean, Stayer_Mean, Net_Mean, Gross_Turnover)
+tests <- tibble(
+  contrast = c("Middle - Early", "Late - Middle"),
+  exit_diff = c(mean(middle$exit_pct, na.rm=TRUE) - mean(early$exit_pct, na.rm=TRUE),
+                mean(late$exit_pct, na.rm=TRUE) - mean(middle$exit_pct, na.rm=TRUE)),
+  exit_p = c(t.test(middle$exit_pct, early$exit_pct)$p.value,
+             t.test(late$exit_pct, middle$exit_pct)$p.value),
+  net_diff = c(mean(middle$net_change_pct, na.rm=TRUE) - mean(early$net_change_pct, na.rm=TRUE),
+               mean(late$net_change_pct, na.rm=TRUE) - mean(middle$net_change_pct, na.rm=TRUE)),
+  net_p = c(t.test(middle$net_change_pct, early$net_change_pct)$p.value,
+            t.test(late$net_change_pct, middle$net_change_pct)$p.value)
+)
 
-print(cash_coarse, digits = 1, width = Inf)
+#-----------------------------#
+# 9) SAVE RESULTS
+#-----------------------------#
+velocity_results_step15 <- list(
+  cfg = cfg,
+  timing_data = timing_data,
+  timing_long = timing_long,
+  weekly_agg = weekly_agg,
+  support_week = support_week,
+  fits = fits,
+  preds = preds_df,
+  derivs = derivs_df,
+  completion_tbl_deriv = completion_tbl_deriv,
+  completion_tbl_level = completion_tbl_level,
+  coarse_decomp = coarse_decomp,
+  tests = tests,
+  figures = list.files(cfg$figures_dir, full.names = TRUE)
+)
 
-# ---- Test differences ---------------------------------------------------------------------------
-early_cash <- timing_data %>% filter(deal_type == "Cash", days_to_qtr_end <= 30)
-middle_cash <- timing_data %>% filter(deal_type == "Cash", days_to_qtr_end > 30, days_to_qtr_end <= 60)
-late_cash <- timing_data %>% filter(deal_type == "Cash", days_to_qtr_end > 60)
+saveRDS(velocity_results_step15, file.path(cfg$figures_dir, "velocity_results_step15.rds"))
 
-# Test if middle differs from early
-t_exit <- t.test(middle_cash$exit_pct, early_cash$exit_pct)
-t_net <- t.test(middle_cash$net_change_pct, early_cash$net_change_pct)
+cat("\nSaved: ", file.path(cfg$figures_dir, "velocity_results_step15.rds"), "\n\n")
 
-cat("Middle vs Early:\n")
-cat(sprintf("  Exit difference: %.1f pp (p=%.3f) %s\n",
-            mean(middle_cash$exit_pct) - mean(early_cash$exit_pct),
-            t_exit$p.value,
-            ifelse(t_exit$p.value < 0.05, "**", "")))
-cat(sprintf("  Net difference:  %.1f pp (p=%.3f) %s\n\n",
-            mean(middle_cash$net_change_pct) - mean(early_cash$net_change_pct),
-            t_net$p.value,
-            ifelse(t_net$p.value < 0.05, "**", "")))
+cat("Completion days (LEVEL-based; includes isotonic):\n")
+print(completion_tbl_level)
 
-# Test if late differs from middle
-t_exit_late <- t.test(late_cash$exit_pct, middle_cash$exit_pct)
-t_net_late <- t.test(late_cash$net_change_pct, middle_cash$net_change_pct)
+cat("\nCompletion days (DERIV-based; GAM only):\n")
+print(completion_tbl_deriv)
 
-cat("Late vs Middle:\n")
-cat(sprintf("  Exit difference: %.1f pp (p=%.3f) %s\n",
-            mean(late_cash$exit_pct) - mean(middle_cash$exit_pct),
-            t_exit_late$p.value,
-            ifelse(t_exit_late$p.value < 0.05, "**", "")))
-cat(sprintf("  Net difference:  %.1f pp (p=%.3f) %s\n\n",
-            mean(late_cash$net_change_pct) - mean(middle_cash$net_change_pct),
-            t_net_late$p.value,
-            ifelse(t_net_late$p.value < 0.05, "**", "")))
+cat("\nCoarse decomposition:\n")
+print(coarse_decomp)
+
+cat("\nDifference tests:\n")
+print(tests)
+	   
 
 # PHASE 1: Early (Days 1-30, N=119)
 #  Exit:   13.1%  ← Baseline institutional departure
@@ -2086,318 +2623,1812 @@ cat(sprintf("  Net difference:  %.1f pp (p=%.3f) %s\n\n",
 # deal-level data. *** p<0.01, * p<0.10.
 
 
-#=================================================================================================
-# ---- Complete Model Fitting Pipeline -----------------------------------------------------------
+#==================================================================================================
+# STEP 15: VELOCITY ANALYSIS - INSTITUTIONAL TRADING SPEED (COMPREHENSIVE)
+#
+# Philosophy: Combine Version 1's methodological rigor with Version 2's narrative clarity
+# 
+# Key features:
+#   - NO hard cutoffs (use precision weighting instead)
+#   - Multiple model families with formal selection
+#   - Bootstrap validation across all models
+#   - Derivative-based velocity analysis
+#   - Phase decomposition with formal ANOVA
+#   - Dual completion metrics (level + velocity)
+#   - Publication-ready figures and tables
+#
+# Inputs:  deals_panel, deals_with_io
+# Outputs: figures_step15/, velocity_results_step15.rds, summary tables
+#==================================================================================================
 
-library(mgcv)
-library(segmented)
-library(quantreg)
-library(dplyr)
-library(ggplot2)
+suppressPackageStartupMessages({
+    library(dplyr)
+    library(tidyr)
+    library(purrr)
+    library(ggplot2)
+    library(mgcv)
+    library(splines)
+    library(gratia)
+    library(segmented)
+    library(conflicted)
+})
 
-# ---- Create Weekly Aggregation (Optimal Resolution) --------------------------------------------
-weekly_agg <- timing_data %>%
-  filter(deal_type == "Cash") %>%
-  mutate(week = floor(days_to_qtr_end / 7)) %>%
-  group_by(week) %>%
-  summarise(
-    n_deals = n(),
-    days_to_qtr_end = mean(days_to_qtr_end),
-    mean_exit = mean(exit_pct, na.rm = TRUE),
-    mean_entry = mean(entry_pct, na.rm = TRUE),
-    mean_net = mean(net_change_pct, na.rm = TRUE),
-    median_exit = median(exit_pct, na.rm = TRUE),
-    median_net = median(net_change_pct, na.rm = TRUE),
-    .groups = "drop"
-  ) %>%
-  filter(n_deals >= 5)  # Require at least 5 deals per week
+conflicts_prefer(dplyr::filter)
+conflicts_prefer(dplyr::lag)
+conflicts_prefer(dplyr::select)
+conflicts_prefer(dplyr::first)
 
-cat(sprintf("Weekly data: %d week-buckets\n", nrow(weekly_agg)))
-cat(sprintf("  Total deals: %d\n", sum(weekly_agg$n_deals)))
-cat(sprintf("  Mean deals/week: %.1f\n\n", mean(weekly_agg$n_deals)))
+#==================================================================================================
+# SECTION 1: CONFIGURATION
+#==================================================================================================
 
-# ---- Comprehensive Model Fitting Function ------------------------------------------------------
+cfg <- list(
+    # Sample
+    deal_type_pattern = "Cash",
+    min_days = 1,
+    max_days = 90,
+    week_width = 7,
+    
+    # Phases
+    phase_breaks = c(30, 60),  # Early: 1-30, Middle: 31-60, Late: 61-90
+    
+    # Model fitting
+    gam_k_weekly = 6,
+    gam_k_deal = 10,
+    bootstrap_n = 1000,
+    bootstrap_seed = 42,
+    
+    # Completion criteria
+    completion_L = 14,          # derivative: CI includes 0 for L consecutive days
+    completion_frac = 0.95,     # level: reaches 95% of day-90 value
+    
+    # Weighting
+    weight_floor_quantile = 0.10,
+    
+    # Output
+    figures_dir = "figures_step15",
+    export_dpi = 450,
+    theme_base = 14,
+    
+    # Prediction grid
+    grid_days = 1:90,
+    grid_horizons = c(15, 30, 45, 60, 75, 90)
+)
 
-fit_all_models <- function(data, outcome_var, data_name = "") {
-  
-  cat(sprintf("\nFitting models for: %s\n", data_name))
-  cat(strrep("-", 70), "\n")
-  
-  models <- list()
-  
-  # Linear models
-  models$linear <- lm(reformulate("days_to_qtr_end", outcome_var), 
-                     data = data, weights = n_deals)
-  
-  models$quad <- lm(reformulate("poly(days_to_qtr_end, 2)", outcome_var),
-                   data = data, weights = n_deals)
-  
-  models$cubic <- lm(reformulate("poly(days_to_qtr_end, 3)", outcome_var),
-                    data = data, weights = n_deals)
-  
-  # Splines
-  models$ns3 <- lm(reformulate("splines::ns(days_to_qtr_end, df=3)", outcome_var),
-                  data = data, weights = n_deals)
-  
-  models$ns4 <- lm(reformulate("splines::ns(days_to_qtr_end, df=4)", outcome_var),
-                  data = data, weights = n_deals)
-  
-  models$ns5 <- lm(reformulate("splines::ns(days_to_qtr_end, df=5)", outcome_var),
-                  data = data, weights = n_deals)
-  
-  # GAMs
-  models$gam_tp <- tryCatch(
-    gam(reformulate("s(days_to_qtr_end, bs='tp', k=5)", outcome_var),
-        data = data, weights = n_deals, method = "REML"),
-    error = function(e) NULL
-  )
-  
-  models$gam_cr <- tryCatch(
-    gam(reformulate("s(days_to_qtr_end, bs='cr', k=5)", outcome_var),
-        data = data, weights = n_deals, method = "REML"),
-    error = function(e) NULL
-  )
-  
-  # Segmented
-  lm_base <- models$linear
-  
-  models$seg1 <- tryCatch(
-    segmented(lm_base, seg.Z = ~days_to_qtr_end, npsi = 1,
-             control = seg.control(display = FALSE, it.max = 100)),
-    error = function(e) NULL
-  )
-  
-  models$seg2 <- tryCatch(
-    segmented(lm_base, seg.Z = ~days_to_qtr_end, npsi = 2,
-             control = seg.control(display = FALSE, it.max = 100)),
-    error = function(e) NULL
-  )
-  
-  # Model comparison
-  comparison <- tibble(Model = names(models)) %>%
-    mutate(
-      DF = map_int(Model, ~{
-        m <- models[[.x]]
-        if (is.null(m)) return(NA_integer_)
-        if (inherits(m, "segmented")) return(length(coef(m)))
-        if (inherits(m, "gam")) return(as.integer(sum(m$edf)))
-        length(coef(m))
-      }),
-      AIC = map_dbl(Model, ~{
-        m <- models[[.x]]
-        if (is.null(m)) return(NA_real_)
-        AIC(m)
-      }),
-      R2 = map_dbl(Model, ~{
-        m <- models[[.x]]
-        if (is.null(m)) return(NA_real_)
-        if (inherits(m, "gam")) return(summary(m)$r.sq)
-        summary(m)$r.squared
-      })
+dir.create(cfg$figures_dir, showWarnings = FALSE, recursive = TRUE)
+
+#==================================================================================================
+# SECTION 2: DATA PREPARATION
+#==================================================================================================
+
+cat("=" %>% rep(80) %>% paste(collapse=""), "\n")
+cat("STEP 15: VELOCITY ANALYSIS\n")
+cat("=" %>% rep(80) %>% paste(collapse=""), "\n\n")
+
+# 2.1 Construct timing data
+timing_data_raw <- deals_panel %>%
+    left_join(
+        deals_with_io %>% select(master_deal_no, target_permno, dateann),
+        by = c("master_deal_no", "permno" = "target_permno")
     ) %>%
-    filter(!is.na(AIC)) %>%
-    arrange(AIC) %>%
-    mutate(Delta_AIC = AIC - min(AIC))
-  
-  best_name <- comparison$Model[1]
-  
-  cat(sprintf("✓ Best model: %s (AIC=%.1f, R²=%.3f)\n", 
-              best_name, min(comparison$AIC), comparison$R2[1]))
-  
-  list(models = models, comparison = comparison,
-       best_name = best_name, best_model = models[[best_name]])
+    filter(!is.na(dateann), !is.na(t_0)) %>%
+    mutate(days_to_qtr_end = as.numeric(t_0 - dateann)) %>%
+    filter(days_to_qtr_end >= cfg$min_days, days_to_qtr_end <= cfg$max_days) %>%
+    filter(grepl(cfg$deal_type_pattern, deal_type, ignore.case = TRUE))
+
+stopifnot(nrow(timing_data_raw) > 0)
+
+cat(sprintf("Sample: %d deal-quarters (%s deals)\n", 
+            nrow(timing_data_raw), 
+            cfg$deal_type_pattern))
+cat(sprintf("  Days range: %d to %d\n", 
+            min(timing_data_raw$days_to_qtr_end), 
+            max(timing_data_raw$days_to_qtr_end)))
+cat(sprintf("  Mean days: %.1f (SD=%.1f)\n\n", 
+            mean(timing_data_raw$days_to_qtr_end), 
+            sd(timing_data_raw$days_to_qtr_end)))
+
+# 2.2 Phase assignment
+timing_data <- timing_data_raw %>%
+    mutate(
+        phase = case_when(
+            days_to_qtr_end <= cfg$phase_breaks[1] ~ "Early",
+            days_to_qtr_end <= cfg$phase_breaks[2] ~ "Middle",
+            TRUE ~ "Late"
+        ),
+        phase = factor(phase, levels = c("Early", "Middle", "Late")),
+        week = floor((days_to_qtr_end - 1) / cfg$week_width) + 1,
+        week_mid = (week - 0.5) * cfg$week_width
+    )
+
+# 2.3 Long format for component analysis
+timing_long <- timing_data %>%
+    select(master_deal_no, permno, deal_type, dateann, t_0, 
+           days_to_qtr_end, week, week_mid, phase,
+           exit_pct, entry_pct, net_change_pct) %>%
+    pivot_longer(
+        cols = c(exit_pct, entry_pct, net_change_pct),
+        names_to = "component_raw",
+        values_to = "value"
+    ) %>%
+    mutate(
+        component = recode(component_raw,
+                           exit_pct = "Exit",
+                           entry_pct = "Entry",
+                           net_change_pct = "Net"),
+        component = factor(component, levels = c("Exit", "Entry", "Net"))
+    )
+
+#==================================================================================================
+# SECTION 3: PHASE ANALYSIS (Version 2 approach, improved)
+#==================================================================================================
+
+cat("=" %>% rep(80) %>% paste(collapse=""), "\n")
+cat("PHASE ANALYSIS\n")
+cat("=" %>% rep(80) %>% paste(collapse=""), "\n\n")
+
+# 3.1 Phase decomposition
+phase_decomp <- timing_data %>%
+    group_by(phase) %>%
+    summarise(
+        N = n(),
+        Days_Mean = mean(days_to_qtr_end),
+        Days_Range = sprintf("%d-%d", min(days_to_qtr_end), max(days_to_qtr_end)),
+        
+        Exit_Mean = mean(exit_pct, na.rm = TRUE),
+        Exit_SE = sd(exit_pct, na.rm = TRUE) / sqrt(n()),
+        
+        Entry_Mean = mean(entry_pct, na.rm = TRUE),
+        Entry_SE = sd(entry_pct, na.rm = TRUE) / sqrt(n()),
+        
+        Net_Mean = mean(net_change_pct, na.rm = TRUE),
+        Net_SE = sd(net_change_pct, na.rm = TRUE) / sqrt(n()),
+        
+        Stayer_Mean = Net_Mean - Entry_Mean + Exit_Mean,
+        
+        Gross_Turnover = abs(Exit_Mean) + abs(Entry_Mean) + abs(Stayer_Mean),
+        .groups = "drop"
+    )
+
+cat("Phase Decomposition:\n")
+print(phase_decomp, digits = 2, width = Inf)
+cat("\n")
+
+# 3.2 Formal ANOVA tests (better than pairwise t-tests)
+anova_results <- tibble(
+    Component = c("Exit", "Entry", "Net"),
+    F_stat = NA_real_,
+    p_value = NA_real_,
+    interpretation = NA_character_
+)
+
+for (i in 1:3) {
+    comp <- c("exit_pct", "entry_pct", "net_change_pct")[i]
+    formula_str <- paste(comp, "~ phase")
+    
+    model <- lm(as.formula(formula_str), data = timing_data)
+    anova_res <- anova(model)
+    
+    anova_results$F_stat[i] <- anova_res$`F value`[1]
+    anova_results$p_value[i] <- anova_res$`Pr(>F)`[1]
+    anova_results$interpretation[i] <- ifelse(
+        anova_res$`Pr(>F)`[1] < 0.001, "***",
+        ifelse(anova_res$`Pr(>F)`[1] < 0.01, "**",
+               ifelse(anova_res$`Pr(>F)`[1] < 0.05, "*", "n.s."))
+    )
 }
 
-# ---- Fit All Components ------------------------------------------------------------------------
+cat("ANOVA: Phase Effect on Trading Components\n")
+print(anova_results, digits = 3)
+cat("\n")
 
-exit_models <- fit_all_models(weekly_agg, "mean_exit", "Cash Exit")
-entry_models <- fit_all_models(weekly_agg, "mean_entry", "Cash Entry")
-net_models <- fit_all_models(weekly_agg, "mean_net", "Cash Net Change")
+# 3.3 Pairwise comparisons (conditional on significant ANOVA)
+pairwise_tests <- map_dfr(c("Exit", "Entry", "Net"), function(comp_name) {
+    var_name <- case_when(
+        comp_name == "Exit" ~ "exit_pct",
+        comp_name == "Entry" ~ "entry_pct",
+        comp_name == "Net" ~ "net_change_pct"
+    )
+    
+    early <- timing_data %>% filter(phase == "Early") %>% pull(!!sym(var_name))
+    middle <- timing_data %>% filter(phase == "Middle") %>% pull(!!sym(var_name))
+    late <- timing_data %>% filter(phase == "Late") %>% pull(!!sym(var_name))
+    
+    t1 <- t.test(middle, early)
+    t2 <- t.test(late, middle)
+    
+    tibble(
+        Component = comp_name,
+        Contrast = c("Middle - Early", "Late - Middle"),
+        Diff = c(mean(middle, na.rm=TRUE) - mean(early, na.rm=TRUE),
+                 mean(late, na.rm=TRUE) - mean(middle, na.rm=TRUE)),
+        t_stat = c(t1$statistic, t2$statistic),
+        p_value = c(t1$p.value, t2$p.value),
+        sig = c(
+            ifelse(t1$p.value < 0.001, "***",
+                   ifelse(t1$p.value < 0.01, "**",
+                          ifelse(t1$p.value < 0.05, "*",
+                                 ifelse(t1$p.value < 0.10, "†", "")))),
+            ifelse(t2$p.value < 0.001, "***",
+                   ifelse(t2$p.value < 0.01, "**",
+                          ifelse(t2$p.value < 0.05, "*",
+                                 ifelse(t2$p.value < 0.10, "†", ""))))
+        )
+    )
+})
 
-# Print comparison tables
-cat("\n\nEXIT MODEL COMPARISON:\n")
-print(exit_models$comparison, digits = 2)
+cat("Pairwise Comparisons:\n")
+print(pairwise_tests, digits = 3)
+cat("\n")
 
-cat("\n\nENTRY MODEL COMPARISON:\n")
-print(entry_models$comparison, digits = 2)
+#==================================================================================================
+# SECTION 4: WEEKLY AGGREGATION (Version 1 approach - NO CUTOFFS)
+#==================================================================================================
 
-cat("\n\nNET MODEL COMPARISON:\n")
-print(net_models$comparison, digits = 2)
+cat("=" %>% rep(80) %>% paste(collapse=""), "\n")
+cat("WEEKLY AGGREGATION\n")
+cat("=" %>% rep(80) %>% paste(collapse=""), "\n\n")
 
-# ---- Bootstrap Validation (Exit only - most important) -----------------------------------------
+# 4.1 Stabilized inverse-variance weights
+stabilized_invvar <- function(se, floor_quantile = cfg$weight_floor_quantile) {
+    ok <- is.finite(se) & se > 0
+    if (!any(ok)) return(rep(1, length(se)))
+    
+    se_floor <- as.numeric(quantile(se[ok], probs = floor_quantile, na.rm = TRUE))
+    se_adj <- pmax(se, se_floor)
+    1 / (se_adj^2)
+}
 
-boot_model_selection <- function(data, indices) {
-  d <- data[indices, ]
+# 4.2 Weekly aggregation (no filtering)
+weekly_agg <- timing_long %>%
+    group_by(component, week, week_mid) %>%
+    summarise(
+        n = sum(!is.na(value)),
+        mean = mean(value, na.rm = TRUE),
+        sd = sd(value, na.rm = TRUE),
+        se = sd / sqrt(pmax(n, 1)),
+        median = median(value, na.rm = TRUE),
+        q25 = quantile(value, 0.25, na.rm = TRUE, names = FALSE),
+        q75 = quantile(value, 0.75, na.rm = TRUE, names = FALSE),
+        .groups = "drop"
+    ) %>%
+    mutate(
+        w_invvar = stabilized_invvar(se),
+        w_n = pmax(n, 1)
+    )
+
+cat(sprintf("Weekly bins: %d (across %d components)\n", 
+            nrow(weekly_agg) / 3, 3))
+cat(sprintf("  Mean deals/week-bin: %.1f (range: %d to %d)\n",
+            mean(weekly_agg$n),
+            min(weekly_agg$n),
+            max(weekly_agg$n)))
+cat(sprintf("  Bins with n<5: %d (%.1f%%) - KEPT with downweighting\n\n",
+            sum(weekly_agg$n < 5),
+            100 * mean(weekly_agg$n < 5)))
+
+# 4.3 Support summary
+support_week <- timing_data %>%
+    group_by(week, week_mid) %>%
+    summarise(n_obs = n(), .groups = "drop")
+
+#==================================================================================================
+# SECTION 5: MODEL FITTING (Comprehensive)
+#==================================================================================================
+
+cat("=" %>% rep(80) %>% paste(collapse=""), "\n")
+cat("MODEL FITTING\n")
+cat("=" %>% rep(80) %>% paste(collapse=""), "\n\n")
+
+# 5.1 Weekly WLS models
+# 5.1 Weekly WLS models
+fit_weekly_wls <- function(df, y = "mean", x = "week_mid", w = "w_invvar") {
+  d <- df %>% filter(is.finite(.data[[y]]), is.finite(.data[[x]]), is.finite(.data[[w]]))
+  wvec <- d[[w]]
   
   models <- list(
-    linear = lm(mean_exit ~ days_to_qtr_end, data = d, weights = n_deals),
-    quad = lm(mean_exit ~ poly(days_to_qtr_end, 2), data = d, weights = n_deals),
-    ns3 = lm(mean_exit ~ splines::ns(days_to_qtr_end, df=3), data = d, weights = n_deals),
-    ns4 = lm(mean_exit ~ splines::ns(days_to_qtr_end, df=4), data = d, weights = n_deals)
+    linear = lm(reformulate(x, y), data = d, weights = wvec),
+    quad   = lm(reformulate(sprintf("poly(%s, 2)", x), y), data = d, weights = wvec),
+    cubic  = lm(reformulate(sprintf("poly(%s, 3)", x), y), data = d, weights = wvec),
+    ns3    = lm(reformulate(sprintf("splines::ns(%s, df=3)", x), y), data = d, weights = wvec),
+    ns4    = lm(reformulate(sprintf("splines::ns(%s, df=4)", x), y), data = d, weights = wvec),
+    ns5    = lm(reformulate(sprintf("splines::ns(%s, df=5)", x), y), data = d, weights = wvec)
   )
   
-  aics <- sapply(models, AIC)
-  names(which.min(aics))
+  # Segmented (with error handling)
+  models$seg1 <- tryCatch({
+    segmented(models$linear, seg.Z = as.formula(paste0("~", x)), npsi = 1,
+             control = seg.control(display = FALSE, it.max = 100))
+  }, error = function(e) NULL)
+  
+  models$seg2 <- tryCatch({
+    segmented(models$linear, seg.Z = as.formula(paste0("~", x)), npsi = 2,
+             control = seg.control(display = FALSE, it.max = 100))
+  }, error = function(e) NULL)
+  
+  # Comparison - FIX: compute valid first, then use it
+  valid_models <- sapply(models, function(m) !is.null(m))
+  
+  comp <- tibble(
+    model = names(models),
+    valid = valid_models
+  ) %>%
+    filter(valid) %>%  # Only keep valid models
+    mutate(
+      aic = map_dbl(model, ~AIC(models[[.x]])),
+      df = map_int(model, ~{
+        m <- models[[.x]]
+        if (inherits(m, "segmented")) length(coef(m)) else length(coef(m))
+      }),
+      r2 = map_dbl(model, ~{
+        m <- models[[.x]]
+        if (inherits(m, "segmented")) {
+          summary(m)$r.squared
+        } else {
+          summary(m)$r.squared
+        }
+      })
+    ) %>%
+    arrange(aic) %>%
+    mutate(delta_aic = aic - min(aic))
+  
+  best <- comp$model[1]
+  list(models = models, comp = comp, best = best, best_model = models[[best]])
 }
 
-set.seed(42)
-boot_results <- replicate(1000, {
-  indices <- sample(nrow(weekly_agg), replace = TRUE)
-  tryCatch(
-    boot_model_selection(weekly_agg, indices),
-    error = function(e) NA_character_
-  )
+# 5.2 Weekly GAM
+fit_weekly_gam <- function(df, y = "mean", x = "week_mid", w = "w_invvar", k = 6) {
+    d <- df %>% filter(is.finite(.data[[y]]), is.finite(.data[[x]]), is.finite(.data[[w]]))
+    wvec <- d[[w]]
+    
+    tryCatch(
+        gam(reformulate(sprintf("s(%s, bs='tp', k=%d)", x, k), y),
+            data = d, weights = wvec, method = "REML"),
+        error = function(e) NULL
+    )
+}
+
+# 5.3 Deal-level GAM
+fit_deal_level_gam <- function(df_long, component_name, k = 10) {
+    d <- df_long %>%
+        filter(component == component_name) %>%
+        filter(is.finite(value), is.finite(days_to_qtr_end))
+    
+    tryCatch(
+        gam(value ~ s(days_to_qtr_end, bs = "tp", k = k),
+            data = d, method = "REML"),
+        error = function(e) NULL
+    )
+}
+
+# 5.4 Isotonic (for Exit/Entry only)
+fit_isotonic_weekly <- function(df, y = "mean", x = "week_mid", w = "w_n", increasing = TRUE) {
+    d <- df %>%
+        filter(is.finite(.data[[y]]), is.finite(.data[[x]]), is.finite(.data[[w]])) %>%
+        arrange(.data[[x]])
+    
+    # Weighted isotonic via replication (capped to avoid memory issues)
+    cap <- 25
+    reps <- pmin(cap, pmax(1, round(d[[w]] / median(d[[w]], na.rm = TRUE))))
+    x_rep <- rep(d[[x]], reps)
+    y_rep <- rep(d[[y]], reps)
+    
+    iso <- stats::isoreg(x_rep, if (increasing) y_rep else -y_rep)
+    pred_fun <- stats::approxfun(iso$x, iso$yf, rule = 2)
+    
+    list(
+        data = d,
+        iso = iso,
+        pred_fun = function(xnew) if (increasing) pred_fun(xnew) else -pred_fun(xnew)
+    )
+}
+
+# 5.5 Fit all components
+components <- levels(weekly_agg$component)
+
+fits <- map(components, function(comp) {
+    cat(sprintf("Fitting models for: %s\n", comp))
+    
+    dfw <- weekly_agg %>% filter(component == comp)
+    
+    out <- list()
+    out$weekly_wls <- fit_weekly_wls(dfw)
+    out$weekly_gam <- fit_weekly_gam(dfw, k = cfg$gam_k_weekly)
+    out$deal_level_gam <- fit_deal_level_gam(timing_long, comp, k = cfg$gam_k_deal)
+    
+    if (comp %in% c("Exit", "Entry")) {
+        out$isotonic <- fit_isotonic_weekly(dfw, increasing = TRUE)
+    }
+    
+    # Print comparison
+    cat(sprintf("  Weekly WLS best: %s (AIC=%.1f, R²=%.3f)\n",
+                out$weekly_wls$best,
+                min(out$weekly_wls$comp$aic),
+                out$weekly_wls$comp$r2[1]))
+    
+    if (!is.null(out$weekly_gam)) {
+        cat(sprintf("  Weekly GAM:      REML (AIC=%.1f, R²=%.3f)\n",
+                    AIC(out$weekly_gam),
+                    summary(out$weekly_gam)$r.sq))
+    }
+    
+    if (!is.null(out$deal_level_gam)) {
+        cat(sprintf("  Deal-level GAM:  REML (AIC=%.1f, R²=%.3f)\n",
+                    AIC(out$deal_level_gam),
+                    summary(out$deal_level_gam)$r.sq))
+    }
+    
+    cat("\n")
+    out
+})
+names(fits) <- components
+
+# 5.6 Consolidate model comparison table
+model_comparison <- map_dfr(components, function(comp) {
+    bind_rows(
+        fits[[comp]]$weekly_wls$comp %>% 
+            mutate(component = comp, family = "Weekly WLS"),
+        
+        if (!is.null(fits[[comp]]$weekly_gam)) {
+            tibble(
+                component = comp,
+                family = "Weekly GAM",
+                model = "gam_tp",
+                valid = TRUE,
+                aic = AIC(fits[[comp]]$weekly_gam),
+                df = sum(fits[[comp]]$weekly_gam$edf),
+                r2 = summary(fits[[comp]]$weekly_gam)$r.sq,
+                delta_aic = NA_real_
+            )
+        },
+        
+        if (!is.null(fits[[comp]]$deal_level_gam)) {
+            tibble(
+                component = comp,
+                family = "Deal-level GAM",
+                model = "gam_deal",
+                valid = TRUE,
+                aic = AIC(fits[[comp]]$deal_level_gam),
+                df = sum(fits[[comp]]$deal_level_gam$edf),
+                r2 = summary(fits[[comp]]$deal_level_gam)$r.sq,
+                delta_aic = NA_real_
+            )
+        }
+    )
+}) %>%
+    group_by(component) %>%
+    mutate(delta_aic = aic - min(aic, na.rm = TRUE)) %>%
+    ungroup() %>%
+    arrange(component, delta_aic)
+
+cat("CONSOLIDATED MODEL COMPARISON:\n")
+print(model_comparison %>% select(component, family, model, aic, delta_aic, r2, df), 
+      digits = 2, width = Inf)
+cat("\n")
+
+#==================================================================================================
+# SECTION 6: BOOTSTRAP VALIDATION (Version 2 approach, expanded)
+#==================================================================================================
+
+cat("=" %>% rep(80) %>% paste(collapse=""), "\n")
+cat("BOOTSTRAP MODEL SELECTION\n")
+cat("=" %>% rep(80) %>% paste(collapse=""), "\n\n")
+
+# 6.1 Bootstrap function (test ALL weekly WLS models)
+boot_model_selection <- function(data, component_name, indices) {
+    d <- data %>% filter(component == component_name)
+    d_boot <- d[indices, ]
+    
+    # Only keep valid rows
+    d_boot <- d_boot %>% 
+        filter(is.finite(mean), is.finite(week_mid), is.finite(w_invvar))
+    
+    if (nrow(d_boot) < 5) return(NA_character_)
+    
+    models <- tryCatch({
+        list(
+            linear = lm(mean ~ week_mid, data = d_boot, weights = w_invvar),
+            quad = lm(mean ~ poly(week_mid, 2), data = d_boot, weights = w_invvar),
+            cubic = lm(mean ~ poly(week_mid, 3), data = d_boot, weights = w_invvar),
+            ns3 = lm(mean ~ splines::ns(week_mid, df=3), data = d_boot, weights = w_invvar),
+            ns4 = lm(mean ~ splines::ns(week_mid, df=4), data = d_boot, weights = w_invvar),
+            ns5 = lm(mean ~ splines::ns(week_mid, df=5), data = d_boot, weights = w_invvar)
+        )
+    }, error = function(e) NULL)
+    
+    if (is.null(models)) return(NA_character_)
+    
+    aics <- sapply(models, function(m) {
+        tryCatch(AIC(m), error = function(e) NA_real_)
+    })
+    
+    if (all(is.na(aics))) return(NA_character_)
+    
+    names(which.min(aics))
+}
+
+# 6.2 Run bootstrap for Exit and Entry (most important)
+set.seed(cfg$bootstrap_seed)
+
+boot_results <- map(c("Exit", "Entry"), function(comp) {
+    cat(sprintf("Bootstrapping %s (%d draws)...\n", comp, cfg$bootstrap_n))
+    
+    results <- replicate(cfg$bootstrap_n, {
+        indices <- sample(nrow(weekly_agg %>% filter(component == comp)), replace = TRUE)
+        boot_model_selection(weekly_agg, comp, indices)
+    })
+    
+    valid <- results[!is.na(results)]
+    
+    tbl <- table(valid)
+    df <- tibble(
+        component = comp,
+        model = names(tbl),
+        frequency = as.integer(tbl),
+        share = frequency / length(valid)
+    ) %>%
+        arrange(desc(frequency))
+    
+    cat(sprintf("  Non-linear selected: %.1f%% of draws\n\n", 
+                100 * (1 - df$share[df$model == "linear"])))
+    
+    df
 })
 
-boot_table <- table(boot_results[!is.na(boot_results)])
-boot_df <- tibble(
-  Model = names(boot_table),
-  Frequency = as.integer(boot_table),
-  Share = Frequency / sum(Frequency)
+boot_summary <- bind_rows(boot_results)
+
+cat("BOOTSTRAP RESULTS:\n")
+print(boot_summary, digits = 3)
+cat("\n")
+
+#==================================================================================================
+# SECTION 7: PREDICTIONS AND COMPLETION METRICS
+#==================================================================================================
+
+cat("=" %>% rep(80) %>% paste(collapse=""), "\n")
+cat("PREDICTIONS & COMPLETION\n")
+cat("=" %>% rep(80) %>% paste(collapse=""), "\n\n")
+
+# 7.1 Helper functions
+predict_lm <- function(model, xnew, xname) {
+    nd <- tibble(!!xname := xnew)
+    p <- predict(model, newdata = nd, se.fit = TRUE)
+    tibble(x = xnew, fit = as.numeric(p$fit), se = as.numeric(p$se.fit))
+}
+
+predict_gam <- function(model, xnew, xname) {
+    nd <- tibble(!!xname := xnew)
+    p <- predict(model, newdata = nd, se.fit = TRUE)
+    tibble(x = xnew, fit = as.numeric(p$fit), se = as.numeric(p$se.fit))
+}
+
+# 7.2 Generate predictions on fine grid
+grid_week <- cfg$grid_days  # Use daily grid for all
+grid_horizons <- cfg$grid_horizons
+
+preds_list <- map(components, function(comp) {
+    out <- list()
+    
+    # Weekly WLS best
+    if (!is.null(fits[[comp]]$weekly_wls$best_model)) {
+        out$wls <- predict_lm(
+            fits[[comp]]$weekly_wls$best_model, 
+            grid_week, 
+            "week_mid"
+        ) %>% mutate(method = "Weekly WLS (best)")
+    }
+    
+    # Weekly GAM
+    if (!is.null(fits[[comp]]$weekly_gam)) {
+        out$wgam <- predict_gam(
+            fits[[comp]]$weekly_gam, 
+            grid_week, 
+            "week_mid"
+        ) %>% mutate(method = "Weekly GAM (REML)")
+    }
+    
+    # Deal-level GAM
+    if (!is.null(fits[[comp]]$deal_level_gam)) {
+        out$dgam <- predict_gam(
+            fits[[comp]]$deal_level_gam, 
+            grid_week, 
+            "days_to_qtr_end"
+        ) %>% mutate(method = "Deal-level GAM (REML)")
+    }
+    
+    # Isotonic
+    if (!is.null(fits[[comp]]$isotonic)) {
+        f <- fits[[comp]]$isotonic$pred_fun
+        out$iso <- tibble(
+            x = grid_week, 
+            fit = f(grid_week), 
+            se = NA_real_, 
+            method = "Isotonic (monotone)"
+        )
+    }
+    
+    bind_rows(out) %>% mutate(component = comp)
+})
+
+preds_df <- bind_rows(preds_list)
+
+# 7.3 Predictions at key horizons
+horizon_preds <- map_dfr(grid_horizons, function(h) {
+    map_dfr(c("Exit", "Entry", "Net"), function(comp) {
+        # Use deal-level GAM as primary (best for paper)
+        model <- fits[[comp]]$deal_level_gam
+        if (is.null(model)) model <- fits[[comp]]$weekly_gam
+        if (is.null(model)) model <- fits[[comp]]$weekly_wls$best_model
+        
+        p <- predict(model, 
+                     newdata = tibble(days_to_qtr_end = h, week_mid = h), 
+                     se.fit = TRUE)
+        
+        tibble(
+            component = comp,
+            days = h,
+            fit = as.numeric(p$fit),
+            se = as.numeric(p$se.fit),
+            ci_low = fit - 1.96*se,
+            ci_high = fit + 1.96*se
+        )
+    })
+})
+
+cat("Predictions at Key Horizons (Deal-level GAM):\n")
+print(horizon_preds %>% select(component, days, fit, se, ci_low, ci_high), 
+      digits = 2)
+cat("\n")
+
+# 7.4 Level-based completion (continued)
+completion_day_level <- function(x, fit, frac = 0.95) {
+    if (length(x) == 0) return(NA_real_)
+    target <- frac * fit[which.max(x)]
+    idx <- which(fit >= target)
+    if (length(idx) == 0) return(NA_real_)
+    x[min(idx)]
+}
+
+completion_tbl_level <- preds_df %>%
+    filter(component %in% c("Exit", "Entry")) %>%
+    group_by(component, method) %>%
+    summarise(
+        completion_day = completion_day_level(x, fit, frac = cfg$completion_frac),
+        .groups = "drop"
+    ) %>%
+    arrange(component, completion_day)
+
+cat("Level-based Completion (95% of day-90 value):\n")
+print(completion_tbl_level, digits = 1)
+cat("\n")
+
+#==================================================================================================
+# SECTION 8: DERIVATIVES (VELOCITY)
+#==================================================================================================
+
+cat("=" %>% rep(80) %>% paste(collapse=""), "\n")
+cat("VELOCITY ANALYSIS (DERIVATIVES)\n")
+cat("=" %>% rep(80) %>% paste(collapse=""), "\n\n")
+
+# 8.1 Helper function for gratia derivatives with robust error handling
+standardize_deriv <- function(d, xvec, method_label, component_label) {
+    if (is.null(d) || nrow(d) == 0) return(tibble())
+    
+    # gratia returns: .derivative, .se, .lower_ci, .upper_ci (with dots)
+    dfit <- d[[".derivative"]]
+    if (is.null(dfit)) dfit <- d[["derivative"]]  # fallback
+    
+    dse <- d[[".se"]]
+    if (is.null(dse)) dse <- d[["se"]]  # fallback
+    
+    if (is.null(dfit) || is.null(dse)) {
+        warning(sprintf("Could not extract derivatives for %s - %s", 
+                        component_label, method_label))
+        return(tibble())
+    }
+    
+    tibble(
+        x = xvec,
+        dfit = as.numeric(dfit),
+        dse = as.numeric(dse),
+        method = method_label,
+        component = component_label
+    )
+}
+
+get_deriv_safe <- function(model, term, data_grid, xcol, method_label, component_label) {
+    if (is.null(model)) return(tibble())
+    
+    d <- tryCatch(
+        gratia::derivatives(model, term = term, data = data_grid, unconditional = FALSE),
+        error = function(e) {
+            warning(sprintf("Derivative failed for %s - %s: %s", 
+                            component_label, method_label, e$message))
+            NULL
+        }
+    )
+    
+    if (is.null(d)) return(tibble())
+    
+    standardize_deriv(d, xvec = data_grid[[xcol]], method_label, component_label)
+}
+
+# 8.2 Compute derivatives for GAM models
+grid_w <- tibble(week_mid = grid_week)
+grid_d <- tibble(days_to_qtr_end = grid_week)
+
+derivs_list <- list()
+
+# Weekly GAM derivatives
+for (comp in components) {
+    if (!is.null(fits[[comp]]$weekly_gam)) {
+        derivs_list[[paste0(comp, "_wgam")]] <- get_deriv_safe(
+            model = fits[[comp]]$weekly_gam,
+            term = "s(week_mid)",
+            data_grid = grid_w,
+            xcol = "week_mid",
+            method_label = "Weekly GAM (REML)",
+            component_label = comp
+        )
+    }
+}
+
+# Deal-level GAM derivatives
+for (comp in components) {
+    if (!is.null(fits[[comp]]$deal_level_gam)) {
+        derivs_list[[paste0(comp, "_dgam")]] <- get_deriv_safe(
+            model = fits[[comp]]$deal_level_gam,
+            term = "s(days_to_qtr_end)",
+            data_grid = grid_d,
+            xcol = "days_to_qtr_end",
+            method_label = "Deal-level GAM (REML)",
+            component_label = comp
+        )
+    }
+}
+
+derivs_df <- bind_rows(derivs_list)
+
+cat(sprintf("Computed derivatives: %d rows across %d component-method combinations\n\n",
+            nrow(derivs_df),
+            length(unique(paste(derivs_df$component, derivs_df$method)))))
+
+# 8.3 Derivative-based completion
+completion_day_deriv <- function(x, dfit, dse, L = 14) {
+    n <- length(x)
+    if (n < L) return(NA_real_)
+    
+    # CI includes 0
+    inside <- (dfit - 1.96*dse <= 0) & (dfit + 1.96*dse >= 0)
+    inside[is.na(inside)] <- FALSE
+    
+    # Find first run of L consecutive days
+    r <- rle(inside)
+    ends <- cumsum(r$lengths)
+    starts <- ends - r$lengths + 1
+    
+    idx <- which(r$values & r$lengths >= L)
+    if (length(idx) == 0) return(NA_real_)
+    
+    x[starts[idx[1]]]
+}
+
+completion_tbl_deriv <- derivs_df %>%
+    filter(component %in% c("Exit", "Entry")) %>%
+    group_by(component, method) %>%
+    summarise(
+        completion_day = completion_day_deriv(x, dfit, dse, L = cfg$completion_L),
+        .groups = "drop"
+    ) %>%
+    arrange(component, completion_day)
+
+cat(sprintf("Derivative-based Completion (%d consecutive days CI includes 0):\n", 
+            cfg$completion_L))
+print(completion_tbl_deriv, digits = 1)
+cat("\n")
+
+#==================================================================================================
+# SECTION 9: VISUALIZATION
+#==================================================================================================
+
+cat("=" %>% rep(80) %>% paste(collapse=""), "\n")
+cat("CREATING FIGURES\n")
+cat("=" %>% rep(80) %>% paste(collapse=""), "\n\n")
+
+# 9.1 Theme
+theme_pub <- theme_minimal(base_size = cfg$theme_base) +
+    theme(
+        panel.grid.minor = element_blank(),
+        plot.title = element_text(face = "bold", size = cfg$theme_base + 2),
+        plot.subtitle = element_text(size = cfg$theme_base - 1),
+        strip.text = element_text(face = "bold"),
+        legend.title = element_blank(),
+        legend.position = "bottom"
+    )
+
+save_plot <- function(name, p, w, h) {
+    ggsave(file.path(cfg$figures_dir, paste0(name, ".pdf")), 
+           p, width = w, height = h)
+    ggsave(file.path(cfg$figures_dir, paste0(name, ".png")), 
+           p, width = w, height = h, dpi = cfg$export_dpi)
+    cat(sprintf("  Saved: %s\n", name))
+}
+
+# 9.2 Weekly points dataframe
+weekly_points <- weekly_agg %>%
+    mutate(component = as.character(component)) %>%
+    transmute(
+        component, 
+        method = "Weekly means", 
+        x = week_mid, 
+        fit = mean, 
+        n = n, 
+        se = se, 
+        q25 = q25, 
+        q75 = q75
+    )
+
+# FIGURE 1: Support by week
+cat("Creating Figure 1: Support...\n")
+p1_support <- ggplot(support_week, aes(x = week_mid, y = n_obs)) +
+    geom_col(fill = "steelblue", alpha = 0.7) +
+    labs(
+        title = "Sample Support Across Days-to-Quarter-End Window",
+        subtitle = sprintf("%s deals, no bins dropped", cfg$deal_type_pattern),
+        x = "Days from announcement to quarter-end",
+        y = "Deal-observations per week"
+    ) +
+    theme_pub
+
+save_plot("01_support_by_week", p1_support, 10, 4)
+
+# FIGURE 2: Phase decomposition with error bars
+cat("Creating Figure 2: Phase decomposition...\n")
+
+phase_long <- phase_decomp %>%
+    select(phase, Exit_Mean, Exit_SE, Entry_Mean, Entry_SE, Net_Mean, Net_SE) %>%
+    pivot_longer(
+        cols = -phase,
+        names_to = c("component", ".value"),
+        names_pattern = "(.+)_(Mean|SE)"
+    ) %>%
+    mutate(
+        component = factor(component, levels = c("Exit", "Entry", "Net")),
+        ci_low = Mean - 1.96*SE,
+        ci_high = Mean + 1.96*SE
+    )
+
+p2_phases <- ggplot(phase_long, aes(x = phase, y = Mean, fill = component)) +
+    geom_col(position = "dodge", alpha = 0.8) +
+    geom_errorbar(
+        aes(ymin = ci_low, ymax = ci_high),
+        position = position_dodge(0.9),
+        width = 0.25
+    ) +
+    scale_fill_manual(values = c("Exit" = "#d73027", 
+                                 "Entry" = "#1a9850", 
+                                 "Net" = "#4575b4")) +
+    labs(
+        title = "Three-Phase Decomposition of Trading Activity",
+        subtitle = sprintf("Early: 1-%d days | Middle: %d-%d days | Late: %d-90 days",
+                           cfg$phase_breaks[1], 
+                           cfg$phase_breaks[1]+1, 
+                           cfg$phase_breaks[2],
+                           cfg$phase_breaks[2]+1),
+        x = "Phase",
+        y = "Flow (% of TSO for Exit/Entry, pp for Net)",
+        fill = "Component"
+    ) +
+    theme_pub
+
+save_plot("02_phase_decomposition", p2_phases, 10, 6)
+
+# FIGURE 3: Comprehensive method comparison (all components)
+cat("Creating Figure 3: Method comparison...\n")
+
+methods_to_show <- c("Weekly WLS (best)", "Weekly GAM (REML)", 
+                     "Deal-level GAM (REML)", "Isotonic (monotone)")
+
+p3_methods <- ggplot() +
+    geom_ribbon(
+        data = preds_df %>% filter(method %in% methods_to_show, is.finite(se)),
+        aes(x = x, ymin = fit - 1.96*se, ymax = fit + 1.96*se, 
+            group = method, fill = method),
+        alpha = 0.15
+    ) +
+    geom_line(
+        data = preds_df %>% filter(method %in% methods_to_show),
+        aes(x = x, y = fit, color = method, linetype = method),
+        linewidth = 1.0
+    ) +
+    geom_point(
+        data = weekly_points,
+        aes(x = x, y = fit, size = n),
+        alpha = 0.5, color = "black"
+    ) +
+    facet_wrap(~component, scales = "free_y", ncol = 1) +
+    scale_size_continuous(range = c(1, 6), name = "Deals/week") +
+    scale_color_brewer(palette = "Set1") +
+    scale_fill_brewer(palette = "Set1") +
+    labs(
+        title = "Cumulative Flow Curves: Method Comparison",
+        subtitle = "Shaded regions = 95% CI | Points = weekly means (no cutoffs applied)",
+        x = "Days from announcement to quarter-end",
+        y = "Cumulative flow (% of TSO for Exit/Entry, pp for Net)",
+        color = "Method",
+        linetype = "Method",
+        fill = "Method"
+    ) +
+    theme_pub +
+    guides(color = guide_legend(nrow = 2),
+           linetype = guide_legend(nrow = 2),
+           fill = guide_legend(nrow = 2))
+
+save_plot("03_method_comparison_all", p3_methods, 10, 11)
+
+# FIGURE 4: Paper-ready two clocks (Exit vs Entry)
+cat("Creating Figure 4: Two clocks (paper version)...\n")
+
+paper_methods <- c("Weekly GAM (REML)", "Deal-level GAM (REML)")
+
+two_df <- preds_df %>%
+    filter(component %in% c("Exit", "Entry"),
+           method %in% paper_methods)
+
+two_pts <- weekly_points %>% 
+    filter(component %in% c("Exit", "Entry"))
+
+# Add completion lines (level-based)
+comp_lines_level <- completion_tbl_level %>%
+    filter(component %in% c("Exit", "Entry"), 
+           method %in% paper_methods,
+           is.finite(completion_day))
+
+p4_two_clocks <- ggplot() +
+    geom_ribbon(
+        data = two_df %>% filter(is.finite(se)),
+        aes(x = x, ymin = fit - 1.96*se, ymax = fit + 1.96*se, 
+            group = method),
+        alpha = 0.12, fill = "gray40"
+    ) +
+    geom_line(
+        data = two_df,
+        aes(x = x, y = fit, linetype = method),
+        linewidth = 1.3
+    ) +
+    geom_point(
+        data = two_pts,
+        aes(x = x, y = fit, size = n),
+        alpha = 0.6, color = "darkred"
+    ) +
+    geom_vline(
+        data = comp_lines_level,
+        aes(xintercept = completion_day, linetype = method),
+        color = "blue", alpha = 0.5
+    ) +
+    facet_wrap(~component, scales = "free_y", ncol = 1) +
+    scale_size_continuous(range = c(1.5, 7), name = "Deals/week") +
+    labs(
+        title = "Two Clocks: Entry Completes Before Exit",
+        subtitle = sprintf("Vertical lines = day reaching %.0f%% of day-90 level (method-specific)",
+                           100 * cfg$completion_frac),
+        x = "Days from announcement to quarter-end",
+        y = "Cumulative flow (% of TSO)",
+        linetype = "Method"
+    ) +
+    theme_pub
+
+save_plot("04_two_clocks_paper", p4_two_clocks, 10, 8)
+
+# FIGURE 5: Velocity (derivatives) with uncertainty
+cat("Creating Figure 5: Velocity...\n")
+
+if (nrow(derivs_df) > 0) {
+    deriv_methods <- unique(derivs_df$method)
+    
+    p5_velocity <- derivs_df %>%
+        filter(method %in% deriv_methods) %>%
+        ggplot(aes(x = x, y = dfit, color = method, fill = method)) +
+        geom_hline(yintercept = 0, linewidth = 0.4, color = "gray30") +
+        geom_ribbon(
+            aes(ymin = dfit - 1.96*dse, ymax = dfit + 1.96*dse, group = method),
+            alpha = 0.15, color = NA
+        ) +
+        geom_line(linewidth = 1.1) +
+        facet_wrap(~component, scales = "free_y", ncol = 1) +
+        scale_color_brewer(palette = "Dark2") +
+        scale_fill_brewer(palette = "Dark2") +
+        labs(
+            title = "Instantaneous Velocity of Institutional Trading",
+            subtitle = "Derivative of smooth with 95% CI from gratia::derivatives()",
+            x = "Days from announcement",
+            y = "Daily velocity (% of TSO per day)",
+            color = "Method",
+            fill = "Method"
+        ) +
+        theme_pub
+    
+    save_plot("05_velocity_derivatives", p5_velocity, 10, 10)
+} else {
+    cat("  Skipping velocity plot (no derivatives computed)\n")
+}
+
+# FIGURE 6: Completion diagnostic (derivative-based, Exit/Entry only)
+cat("Creating Figure 6: Completion diagnostic...\n")
+
+if (nrow(derivs_df %>% filter(component %in% c("Exit", "Entry"))) > 0) {
+    comp_lines_deriv <- completion_tbl_deriv %>%
+        filter(is.finite(completion_day))
+    
+    p6_completion <- derivs_df %>%
+        filter(component %in% c("Exit", "Entry")) %>%
+        ggplot(aes(x = x, y = dfit, color = method)) +
+        geom_hline(yintercept = 0, linewidth = 0.5, linetype = "dashed") +
+        geom_ribbon(
+            aes(ymin = dfit - 1.96*dse, ymax = dfit + 1.96*dse, 
+                group = method, fill = method),
+            alpha = 0.12, color = NA
+        ) +
+        geom_line(linewidth = 1.2) +
+        geom_vline(
+            data = comp_lines_deriv,
+            aes(xintercept = completion_day, color = method),
+            linetype = "dotted", linewidth = 0.8
+        ) +
+        facet_wrap(~component, scales = "free_y", ncol = 1) +
+        scale_color_brewer(palette = "Set1") +
+        scale_fill_brewer(palette = "Set1") +
+        labs(
+            title = "Velocity-Based Completion Diagnostic",
+            subtitle = sprintf("Vertical lines = first day CI includes 0 for %d consecutive days",
+                               cfg$completion_L),
+            x = "Days from announcement",
+            y = "Velocity (derivative)",
+            color = "Method",
+            fill = "Method"
+        ) +
+        theme_pub
+    
+    save_plot("06_velocity_completion", p6_completion, 10, 8)
+} else {
+    cat("  Skipping completion diagnostic (insufficient data)\n")
+}
+
+# FIGURE 7: ECDF by phase (distribution check)
+cat("Creating Figure 7: ECDF by phase...\n")
+
+ecdf_long <- timing_data %>%
+    select(days_to_qtr_end, phase, exit_pct, entry_pct, net_change_pct) %>%
+    pivot_longer(
+        cols = c(exit_pct, entry_pct, net_change_pct),
+        names_to = "component_raw",
+        values_to = "value"
+    ) %>%
+    mutate(
+        component = recode(component_raw,
+                           exit_pct = "Exit",
+                           entry_pct = "Entry", 
+                           net_change_pct = "Net")
+    )
+
+p7_ecdf <- ecdf_long %>%
+    filter(component %in% c("Exit", "Entry")) %>%
+    ggplot(aes(x = value, color = phase)) +
+    stat_ecdf(geom = "step", linewidth = 1.1) +
+    facet_wrap(~component, scales = "free_x", ncol = 1) +
+    scale_color_manual(values = c("Early" = "#fee08b", 
+                                  "Middle" = "#f46d43", 
+                                  "Late" = "#a50026")) +
+    labs(
+        title = "Distribution of Deal-Level Flows by Phase",
+        subtitle = "Tests whether acceleration is broad-based or driven by outliers",
+        x = "Flow (% of TSO)",
+        y = "Cumulative probability",
+        color = "Phase"
+    ) +
+    theme_pub
+
+save_plot("07_ecdf_by_phase", p7_ecdf, 10, 8)
+
+# FIGURE 8: Bootstrap stability
+cat("Creating Figure 8: Bootstrap results...\n")
+
+if (nrow(boot_summary) > 0) {
+    p8_boot <- ggplot(boot_summary, aes(x = reorder(model, -frequency), 
+                                        y = share, fill = component)) +
+        geom_col(position = "dodge", alpha = 0.8) +
+        geom_text(
+            aes(label = sprintf("%.1f%%", 100*share)),
+            position = position_dodge(0.9),
+            vjust = -0.5,
+            size = 3.5
+        ) +
+        scale_fill_manual(values = c("Exit" = "#d73027", "Entry" = "#1a9850")) +
+        scale_y_continuous(labels = scales::percent_format()) +
+        labs(
+            title = "Bootstrap Model Selection Stability",
+            subtitle = sprintf("%d bootstrap resamples | Non-linear strongly preferred",
+                               cfg$bootstrap_n),
+            x = "Model",
+            y = "Selection frequency",
+            fill = "Component"
+        ) +
+        theme_pub +
+        theme(axis.text.x = element_text(angle = 45, hjust = 1))
+    
+    save_plot("08_bootstrap_stability", p8_boot, 10, 6)
+}
+
+cat("\n")
+
+#==================================================================================================
+# SECTION 10: SUMMARY TABLES FOR PAPER
+#==================================================================================================
+
+cat("=" %>% rep(80) %>% paste(collapse=""), "\n")
+cat("SUMMARY TABLES\n")
+cat("=" %>% rep(80) %>% paste(collapse=""), "\n\n")
+
+# Table 1: Phase decomposition (cleaned for paper)
+table1_phase <- phase_decomp %>%
+    mutate(
+        Phase = sprintf("%s (n=%d)", phase, N),
+        Exit = sprintf("%.1f (%.1f)", Exit_Mean, Exit_SE),
+        Entry = sprintf("%.1f (%.1f)", Entry_Mean, Entry_SE),
+        Net = sprintf("%.1f (%.1f)", Net_Mean, Net_SE),
+        Gross = sprintf("%.1f", Gross_Turnover)
+    ) %>%
+    select(Phase, Days_Range, Exit, Entry, Net, Gross)
+
+cat("TABLE 1: Phase Decomposition\n")
+print(table1_phase, width = Inf)
+cat("\n")
+
+# Table 2: Model comparison (best models only)
+table2_models <- model_comparison %>%
+  group_by(component) %>%
+  slice_min(aic, n = 3) %>%
+  ungroup() %>%
+  mutate(
+    Component = component,
+    Family = family,
+    Model = model,
+    AIC = sprintf("%.1f", aic),
+    Delta_AIC = sprintf("%.1f", delta_aic),
+    R2 = sprintf("%.3f", r2)
+  ) %>%
+  select(Component, Family, Model, AIC, Delta_AIC, R2)
+
+cat("TABLE 2: Top 3 Models per Component\n")
+print(table2_models, width = Inf)
+cat("\n")
+
+# Table 3: Key horizon predictions
+table3_horizons <- horizon_preds %>%
+    mutate(
+        Component = component,
+        Days = days,
+        Estimate = sprintf("%.1f", fit),
+        SE = sprintf("%.1f", se),
+        `95% CI` = sprintf("[%.1f, %.1f]", ci_low, ci_high)
+    ) %>%
+    select(Component, Days, Estimate, SE, `95% CI`)
+
+cat("TABLE 3: Predictions at Key Horizons (Deal-level GAM)\n")
+print(table3_horizons, width = Inf)
+cat("\n")
+
+# Table 4: Completion days
+table4_completion <- bind_rows(
+    completion_tbl_level %>% 
+        mutate(metric = "Level (95%)"),
+    completion_tbl_deriv %>% 
+        mutate(metric = "Velocity (zero)")
 ) %>%
-  arrange(desc(Frequency))
+    mutate(
+        Component = component,
+        Method = method,
+        Metric = metric,
+        `Completion Day` = sprintf("%.0f", completion_day)
+    ) %>%
+    select(Component, Method, Metric, `Completion Day`) %>%
+    arrange(Component, Method, Metric)
 
-print(boot_df, digits = 3)
+cat("TABLE 4: Completion Days (Two Metrics)\n")
+print(table4_completion, width = Inf)
+cat("\n")
 
-pct_nonlinear <- 100 * (1 - boot_df$Share[boot_df$Model == "linear"])
-cat(sprintf("\nNon-linear selected: %.1f%% of draws\n\n", pct_nonlinear))
+#==================================================================================================
+# SECTION 11: SAVE RESULTS
+#==================================================================================================
 
-# ---- Predictions at Key Horizons ---------------------------------------------------------------
+cat("=" %>% rep(80) %>% paste(collapse=""), "\n")
+cat("SAVING RESULTS\n")
+cat("=" %>% rep(80) %>% paste(collapse=""), "\n\n")
 
-horizons <- c(15, 30, 45, 60, 75)
+velocity_results_step15 <- list(
+    # Config
+    cfg = cfg,
+    
+    # Data
+    timing_data = timing_data,
+    timing_long = timing_long,
+    weekly_agg = weekly_agg,
+    support_week = support_week,
+    
+    # Phase analysis
+    phase_decomp = phase_decomp,
+    anova_results = anova_results,
+    pairwise_tests = pairwise_tests,
+    
+    # Models
+    fits = fits,
+    model_comparison = model_comparison,
+    
+    # Bootstrap
+    boot_summary = boot_summary,
+    
+    # Predictions
+    preds_df = preds_df,
+    horizon_preds = horizon_preds,
+    
+    # Derivatives
+    derivs_df = derivs_df,
+    
+    # Completion
+    completion_tbl_level = completion_tbl_level,
+    completion_tbl_deriv = completion_tbl_deriv,
+    
+    # Tables for paper
+    tables = list(
+        phase = table1_phase,
+        models = table2_models,
+        horizons = table3_horizons,
+        completion = table4_completion
+    ),
+    
+    # Figure list
+    figures = list.files(cfg$figures_dir, full.names = TRUE)
+)
 
-predictions_df <- map_dfr(horizons, ~{
-  exit_pred <- predict(exit_models$best_model, 
-                      newdata = tibble(days_to_qtr_end = .x), se.fit = TRUE)
-  entry_pred <- predict(entry_models$best_model,
-                       newdata = tibble(days_to_qtr_end = .x), se.fit = TRUE)
-  net_pred <- predict(net_models$best_model,
-                     newdata = tibble(days_to_qtr_end = .x), se.fit = TRUE)
+saveRDS(velocity_results_step15, 
+        file.path(cfg$figures_dir, "velocity_results_step15.rds"))
+
+cat(sprintf("Saved: %s\n", 
+            file.path(cfg$figures_dir, "velocity_results_step15.rds")))
+
+cat("\n")
+
+#==================================================================================================
+# SECTION 12: EXECUTIVE SUMMARY
+#==================================================================================================
+
+cat("=" %>% rep(80) %>% paste(collapse=""), "\n")
+cat("EXECUTIVE SUMMARY\n")
+cat("=" %>% rep(80) %>% paste(collapse=""), "\n\n")
+
+cat("SAMPLE:\n")
+cat(sprintf("  %d %s deal-quarters\n", nrow(timing_data), cfg$deal_type_pattern))
+cat(sprintf("  %d weekly bins (no cutoffs applied)\n", 
+            nrow(weekly_agg) / length(components)))
+cat("\n")
+
+cat("PHASE EFFECTS:\n")
+for (i in 1:nrow(anova_results)) {
+    cat(sprintf("  %s: F=%.2f, p=%.4f %s\n",
+                anova_results$Component[i],
+                anova_results$F_stat[i],
+                anova_results$p_value[i],
+                anova_results$interpretation[i]))
+}
+cat("\n")
+
+cat("KEY FINDINGS (Exit, most important):\n")
+exit_early <- phase_decomp$Exit_Mean[phase_decomp$phase == "Early"]
+exit_middle <- phase_decomp$Exit_Mean[phase_decomp$phase == "Middle"]
+exit_late <- phase_decomp$Exit_Mean[phase_decomp$phase == "Late"]
+
+cat(sprintf("  Early:  %.1f%% of TSO\n", exit_early))
+cat(sprintf("  Middle: %.1f%% (+%.1f pp, %s)\n", 
+            exit_middle, 
+            exit_middle - exit_early,
+            pairwise_tests$sig[pairwise_tests$Component == "Exit" & 
+                                   pairwise_tests$Contrast == "Middle - Early"]))
+cat(sprintf("  Late:   %.1f%% (+%.1f pp, %s)\n",
+            exit_late,
+            exit_late - exit_middle,
+            pairwise_tests$sig[pairwise_tests$Component == "Exit" & 
+                                   pairwise_tests$Contrast == "Late - Middle"]))
+cat("\n")
+
+cat("BEST MODELS:\n")
+for (comp in components) {
+    best <- model_comparison %>%
+        filter(component == comp) %>%
+        slice_min(aic, n = 1)
+    
+    cat(sprintf("  %s: %s %s (AIC=%.1f, R²=%.3f)\n",
+                comp, best$family, best$model, best$aic, best$r2))
+}
+cat("\n")
+
+cat("BOOTSTRAP VALIDATION:\n")
+for (comp in c("Exit", "Entry")) {
+    nonlin_pct <- 100 * (1 - boot_summary$share[
+        boot_summary$component == comp & boot_summary$model == "linear"
+    ])
+    if (length(nonlin_pct) == 0) nonlin_pct <- 100  # linear never selected
+    
+    cat(sprintf("  %s: %.1f%% of draws select non-linear\n", comp, nonlin_pct))
+}
+cat("\n")
+
+cat("COMPLETION (Deal-level GAM):\n")
+exit_comp <- completion_tbl_deriv %>%
+    filter(component == "Exit", method == "Deal-level GAM (REML)") %>%
+    pull(completion_day)
+
+entry_comp <- completion_tbl_deriv %>%
+    filter(component == "Entry", method == "Deal-level GAM (REML)") %>%
+    pull(completion_day)
+
+if (length(exit_comp) > 0) {
+    cat(sprintf("  Exit velocity crosses zero: day %.0f\n", exit_comp))
+}
+if (length(entry_comp) > 0) {
+    cat(sprintf("  Entry velocity crosses zero: day %.0f\n", entry_comp))
+}
+
+exit_comp_level <- completion_tbl_level %>%
+    filter(component == "Exit", method == "Deal-level GAM (REML)") %>%
+    pull(completion_day)
+
+if (length(exit_comp_level) > 0) {
+    cat(sprintf("  Exit reaches 95%% of day-90: day %.0f\n", exit_comp_level))
+}
+cat("\n")
+
+cat("FIGURES CREATED:\n")
+figs <- list.files(cfg$figures_dir, pattern = "\\.(pdf|png)$")
+for (f in sort(unique(sub("\\.(pdf|png)$", "", figs)))) {
+    cat(sprintf("  %s (.pdf + .png)\n", f))
+}
+cat("\n")
+
+cat("=" %>% rep(80) %>% paste(collapse=""), "\n")
+cat("STEP 15 COMPLETE\n")
+cat("=" %>% rep(80) %>% paste(collapse=""), "\n\n")
+
+#==================================================================================================
+# STEP 15B: OPTIMAL SEGMENTATION ANALYSIS
+# Goal: Find data-driven breakpoints and test alternative phase definitions
+#==================================================================================================
+
+cat("=" %>% rep(80) %>% paste(collapse=""), "\n")
+cat("OPTIMAL SEGMENTATION ANALYSIS\n")
+cat("=" %>% rep(80) %>% paste(collapse=""), "\n\n")
+
+#--------------------------------------------------------------------------------------------------
+# 1. EXTRACT BREAKPOINTS FROM SEGMENTED MODELS
+#--------------------------------------------------------------------------------------------------
+
+cat("1. EXTRACTING SEGMENTED REGRESSION BREAKPOINTS\n")
+cat("-" %>% rep(80) %>% paste(collapse=""), "\n\n")
+
+# Function to safely extract breakpoints
+extract_breakpoints <- function(seg_model) {
+  if (is.null(seg_model)) return(NULL)
+  if (!inherits(seg_model, "segmented")) return(NULL)
+  
+  bp <- tryCatch(
+    summary(seg_model)$psi,
+    error = function(e) NULL
+  )
+  
+  if (is.null(bp)) return(NULL)
+  
+  # psi is a matrix with columns: Est., St.Err, etc.
+  if (is.matrix(bp)) {
+    data.frame(
+      breakpoint = bp[, "Est."],
+      se = bp[, "St.Err"],
+      row.names = NULL
+    )
+  } else {
+    NULL
+  }
+}
+
+# Extract for Entry (seg1 won)
+entry_bp <- extract_breakpoints(fits[["Entry"]]$weekly_wls$models$seg1)
+cat("ENTRY (seg1 - 1 breakpoint):\n")
+if (!is.null(entry_bp)) {
+  print(entry_bp, digits = 1)
+  cat(sprintf("\n  → Entry regime changes at day %.0f (±%.1f)\n\n", 
+              entry_bp$breakpoint[1], 1.96*entry_bp$se[1]))
+} else {
+  cat("  No breakpoints extracted (model may have failed)\n\n")
+}
+
+# Extract for Exit (try seg2 - 2 breakpoints)
+exit_bp <- extract_breakpoints(fits[["Exit"]]$weekly_wls$models$seg2)
+cat("EXIT (seg2 - 2 breakpoints):\n")
+if (!is.null(exit_bp)) {
+  print(exit_bp, digits = 1)
+  cat(sprintf("\n  → Exit regime 1→2 at day %.0f (±%.1f)\n", 
+              exit_bp$breakpoint[1], 1.96*exit_bp$se[1]))
+  if (nrow(exit_bp) > 1) {
+    cat(sprintf("  → Exit regime 2→3 at day %.0f (±%.1f)\n\n", 
+                exit_bp$breakpoint[2], 1.96*exit_bp$se[2]))
+  }
+} else {
+  cat("  No breakpoints extracted (model may have failed)\n\n")
+}
+
+#--------------------------------------------------------------------------------------------------
+# 2. VELOCITY-BASED BREAKPOINTS (using derivative peaks)
+#--------------------------------------------------------------------------------------------------
+
+cat("\n2. VELOCITY-BASED BREAKPOINTS (derivative analysis)\n")
+cat("-" %>% rep(80) %>% paste(collapse=""), "\n\n")
+
+velocity_breakpoints <- derivs_df %>%
+  filter(!is.na(dfit), !is.na(dse)) %>%
+  group_by(component, method) %>%
+  summarise(
+    peak_velocity_day = x[which.max(abs(dfit))],
+    peak_velocity_value = max(abs(dfit), na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  filter(component %in% c("Exit", "Entry"))
+
+cat("Peak Velocity Days (where acceleration is maximum):\n")
+print(velocity_breakpoints, digits = 1)
+cat("\n")
+
+#--------------------------------------------------------------------------------------------------
+# 3. ALTERNATIVE MANUAL SEGMENTATIONS
+#--------------------------------------------------------------------------------------------------
+
+cat("\n3. TESTING ALTERNATIVE MANUAL SEGMENTATIONS\n")
+cat("-" %>% rep(80) %>% paste(collapse=""), "\n\n")
+
+# Define multiple segmentation schemes
+segmentation_schemes <- list(
+  original = c(30, 60),
+  
+  # Hypothesis 1: Very early takeoff (days 1-14)
+  early_takeoff = c(14, 45),
+  
+  # Hypothesis 2: Sharp middle peak (zoom into acceleration)
+  sharp_middle = c(20, 50),
+  
+  # Hypothesis 3: Data-driven from Entry seg1 (use extracted breakpoint)
+  data_driven_entry = if (!is.null(entry_bp)) c(round(entry_bp$breakpoint[1]), 60) else c(30, 60),
+  
+  # Hypothesis 4: Data-driven from Exit seg2 (use both breakpoints)
+  data_driven_exit = if (!is.null(exit_bp) && nrow(exit_bp) == 2) {
+    round(exit_bp$breakpoint)
+  } else {
+    c(25, 55)
+  },
+  
+  # Hypothesis 5: Velocity-based (use peak velocity days)
+  velocity_based = if (nrow(velocity_breakpoints) >= 2) {
+    c(round(mean(velocity_breakpoints$peak_velocity_day[1:2])), 60)
+  } else {
+    c(30, 60)
+  },
+  
+  # Hypothesis 6: Finer early resolution
+  fine_early = c(10, 30, 50, 70)  # 4 phases
+)
+
+# Function to compute phase stats for any breakpoint set
+compute_phase_stats <- function(data, breaks, scheme_name) {
+  
+  # Create phase labels
+  if (length(breaks) == 2) {
+    phase_labels <- c(
+      sprintf("Phase 1 (1-%d)", breaks[1]),
+      sprintf("Phase 2 (%d-%d)", breaks[1]+1, breaks[2]),
+      sprintf("Phase 3 (%d-90)", breaks[2]+1)
+    )
+    
+    data_phased <- data %>%
+      mutate(
+        phase_new = case_when(
+          days_to_qtr_end <= breaks[1] ~ phase_labels[1],
+          days_to_qtr_end <= breaks[2] ~ phase_labels[2],
+          TRUE ~ phase_labels[3]
+        ),
+        phase_new = factor(phase_new, levels = phase_labels)
+      )
+    
+  } else if (length(breaks) == 4) {
+    # 4-phase version
+    phase_labels <- c(
+      sprintf("Phase 1 (1-%d)", breaks[1]),
+      sprintf("Phase 2 (%d-%d)", breaks[1]+1, breaks[2]),
+      sprintf("Phase 3 (%d-%d)", breaks[2]+1, breaks[3]),
+      sprintf("Phase 4 (%d-%d)", breaks[3]+1, breaks[4]),
+      sprintf("Phase 5 (%d-90)", breaks[4]+1)
+    )
+    
+    data_phased <- data %>%
+      mutate(
+        phase_new = case_when(
+          days_to_qtr_end <= breaks[1] ~ phase_labels[1],
+          days_to_qtr_end <= breaks[2] ~ phase_labels[2],
+          days_to_qtr_end <= breaks[3] ~ phase_labels[3],
+          days_to_qtr_end <= breaks[4] ~ phase_labels[4],
+          TRUE ~ phase_labels[5]
+        ),
+        phase_new = factor(phase_new, levels = phase_labels)
+      )
+  } else {
+    return(NULL)
+  }
+  
+  # Compute phase means
+  stats <- data_phased %>%
+    group_by(phase_new) %>%
+    summarise(
+      n = n(),
+      exit_mean = mean(exit_pct, na.rm = TRUE),
+      exit_se = sd(exit_pct, na.rm = TRUE) / sqrt(n()),
+      entry_mean = mean(entry_pct, na.rm = TRUE),
+      entry_se = sd(entry_pct, na.rm = TRUE) / sqrt(n()),
+      net_mean = mean(net_change_pct, na.rm = TRUE),
+      net_se = sd(net_change_pct, na.rm = TRUE) / sqrt(n()),
+      .groups = "drop"
+    ) %>%
+    mutate(scheme = scheme_name)
+  
+  # ANOVA F-stat for exit
+  anova_exit <- anova(lm(exit_pct ~ phase_new, data = data_phased))
+  f_stat <- anova_exit$`F value`[1]
+  p_val <- anova_exit$`Pr(>F)`[1]
+  
+  list(
+    stats = stats,
+    f_stat = f_stat,
+    p_value = p_val,
+    breaks = breaks
+  )
+}
+
+# Test all schemes
+segmentation_results <- map(names(segmentation_schemes), function(scheme_name) {
+  breaks <- segmentation_schemes[[scheme_name]]
+  cat(sprintf("Testing: %s (breaks at: %s)\n", 
+              scheme_name, 
+              paste(breaks, collapse = ", ")))
+  
+  result <- compute_phase_stats(timing_data, breaks, scheme_name)
+  
+  if (!is.null(result)) {
+    cat(sprintf("  F-stat (Exit): %.2f, p = %.4f\n", result$f_stat, result$p_value))
+  }
+  
+  result
+})
+names(segmentation_results) <- names(segmentation_schemes)
+
+cat("\n")
+
+#--------------------------------------------------------------------------------------------------
+# 4. COMPARE SEGMENTATION SCHEMES
+#--------------------------------------------------------------------------------------------------
+
+cat("\n4. SEGMENTATION COMPARISON (which breakpoints best explain variation?)\n")
+cat("-" %>% rep(80) %>% paste(collapse=""), "\n\n")
+
+# Extract F-stats and p-values
+comparison_table <- map_dfr(names(segmentation_results), function(scheme_name) {
+  result <- segmentation_results[[scheme_name]]
+  if (is.null(result)) return(NULL)
   
   tibble(
-    Days = .x,
-    Exit_Est = exit_pred$fit,
-    Exit_SE = exit_pred$se.fit,
-    Entry_Est = entry_pred$fit,
-    Entry_SE = entry_pred$se.fit,
-    Net_Est = net_pred$fit,
-    Net_SE = net_pred$se.fit
+    scheme = scheme_name,
+    breakpoints = paste(result$breaks, collapse = ", "),
+    n_phases = length(result$breaks) + 1,
+    F_stat_exit = result$f_stat,
+    p_value_exit = result$p_value,
+    exit_range = sprintf("%.1f to %.1f", 
+                        min(result$stats$exit_mean), 
+                        max(result$stats$exit_mean)),
+    max_jump = max(diff(result$stats$exit_mean))
   )
+}) %>%
+  arrange(desc(F_stat_exit))
+
+cat("Comparison Table (ranked by F-statistic for Exit):\n")
+print(comparison_table, digits = 3, width = Inf)
+cat("\n")
+
+# Best scheme
+best_scheme <- comparison_table$scheme[1]
+cat(sprintf("*** BEST SEGMENTATION: %s (F=%.2f, p=%.4f) ***\n\n",
+            best_scheme,
+            comparison_table$F_stat_exit[1],
+            comparison_table$p_value_exit[1]))
+
+#--------------------------------------------------------------------------------------------------
+# 5. DETAILED VIEW OF BEST SEGMENTATION
+#--------------------------------------------------------------------------------------------------
+
+cat("\n5. DETAILED BREAKDOWN: BEST SEGMENTATION\n")
+cat("-" %>% rep(80) %>% paste(collapse=""), "\n\n")
+
+best_result <- segmentation_results[[best_scheme]]
+
+cat(sprintf("Scheme: %s\n", best_scheme))
+cat(sprintf("Breakpoints: %s\n", paste(best_result$breaks, collapse = ", ")))
+cat(sprintf("F-statistic: %.2f (p = %.4f)\n\n", best_result$f_stat, best_result$p_value))
+
+cat("Phase Statistics:\n")
+best_stats <- best_result$stats %>%
+  mutate(
+    Exit = sprintf("%.1f (±%.1f)", exit_mean, 1.96*exit_se),
+    Entry = sprintf("%.1f (±%.1f)", entry_mean, 1.96*entry_se),
+    Net = sprintf("%.1f (±%.1f)", net_mean, 1.96*net_se)
+  ) %>%
+  select(phase_new, n, Exit, Entry, Net)
+
+print(best_stats, width = Inf)
+cat("\n")
+
+# Pairwise comparisons for best scheme
+cat("Pairwise Exit Comparisons (consecutive phases):\n")
+phases <- levels(best_result$stats$phase_new)
+for (i in 1:(length(phases)-1)) {
+  phase1_data <- timing_data %>% 
+    filter(days_to_qtr_end %in% 
+           (if (i == 1) 1 else best_result$breaks[i-1]+1):best_result$breaks[i])
+  phase2_data <- timing_data %>%
+    filter(days_to_qtr_end %in% 
+           (best_result$breaks[i]+1):(if (i == length(phases)-1) 90 else best_result$breaks[i+1]))
+  
+  if (nrow(phase1_data) > 0 && nrow(phase2_data) > 0) {
+    t_test <- t.test(phase2_data$exit_pct, phase1_data$exit_pct)
+    
+    cat(sprintf("  %s → %s: Δ = %.2f pp (t=%.2f, p=%.4f) %s\n",
+                phases[i],
+                phases[i+1],
+                mean(phase2_data$exit_pct, na.rm=TRUE) - mean(phase1_data$exit_pct, na.rm=TRUE),
+                t_test$statistic,
+                t_test$p.value,
+                ifelse(t_test$p.value < 0.001, "***",
+                       ifelse(t_test$p.value < 0.01, "**",
+                              ifelse(t_test$p.value < 0.05, "*", "")))))
+  }
+}
+
+cat("\n")
+
+#--------------------------------------------------------------------------------------------------
+# 6. VISUAL: COMPARE TOP 3 SEGMENTATIONS
+#--------------------------------------------------------------------------------------------------
+
+cat("\n6. CREATING COMPARISON FIGURE\n")
+cat("-" %>% rep(80) %>% paste(collapse=""), "\n\n")
+
+# Get top 3 schemes
+top3_schemes <- comparison_table$scheme[1:min(3, nrow(comparison_table))]
+
+# Prepare data for plotting
+plot_data <- map_dfr(top3_schemes, function(scheme_name) {
+  segmentation_results[[scheme_name]]$stats %>%
+    mutate(scheme = scheme_name)
 })
 
-print(predictions_df, digits = 2)
-
-# --- Create Figures -----------------------------------------------------------------------------
-
-# Fine grid for smooth curves
-pred_grid <- seq(1, 90, by = 1)
-
-# Predictions
-pred_exit <- predict(exit_models$best_model, 
-                    newdata = tibble(days_to_qtr_end = pred_grid), se.fit = TRUE)
-pred_entry <- predict(entry_models$best_model,
-                     newdata = tibble(days_to_qtr_end = pred_grid), se.fit = TRUE)
-pred_net <- predict(net_models$best_model,
-                   newdata = tibble(days_to_qtr_end = pred_grid), se.fit = TRUE)
-
-# FIGURE 1: Cumulative Exit
-p_exit <- ggplot() +
-  geom_ribbon(aes(x = pred_grid, 
-                  ymin = pred_exit$fit - 1.96*pred_exit$se.fit,
-                  ymax = pred_exit$fit + 1.96*pred_exit$se.fit),
-              fill = "steelblue", alpha = 0.2) +
-  geom_line(aes(x = pred_grid, y = pred_exit$fit), 
-            color = "steelblue", linewidth = 1.5) +
-  geom_point(data = weekly_agg, aes(x = days_to_qtr_end, y = mean_exit, size = n_deals),
-             color = "red", alpha = 0.6) +
-  scale_size_continuous(range = c(2, 8), name = "Deals/week") +
-  labs(
-    title = "Cumulative Institutional Exit (Cash Deals)",
-    subtitle = sprintf("Model: %s (AIC=%.1f, R²=%.2f) | Bootstrap: %.0f%% non-linear",
-                      exit_models$best_name, min(exit_models$comparison$AIC),
-                      exit_models$comparison$R2[1], pct_nonlinear),
-    x = "Days from Announcement to Quarter-End",
-    y = "Cumulative Exit (% of TSO)",
-    caption = "Points = weekly averages. Shaded = 95% CI."
+# Create faceted plot
+p_segmentation_compare <- ggplot(plot_data, 
+                                 aes(x = phase_new, y = exit_mean, fill = scheme)) +
+  geom_col(position = "dodge", alpha = 0.8) +
+  geom_errorbar(
+    aes(ymin = exit_mean - 1.96*exit_se, ymax = exit_mean + 1.96*exit_se),
+    position = position_dodge(0.9),
+    width = 0.25
   ) +
-  theme_minimal(base_size = 13) +
-  theme(plot.title = element_text(face = "bold", size = 15))
-
-print(p_exit)
-ggsave("figure_velocity_exit_final.png", p_exit, width = 10, height = 7, dpi = 300)
-
-# FIGURE 2: Three Components
-component_curves <- tibble(
-  days = pred_grid,
-  Exit = pred_exit$fit,
-  Entry = pred_entry$fit,
-  Net = pred_net$fit
-) %>%
-  tidyr::pivot_longer(cols = c(Exit, Entry, Net), names_to = "Component", values_to = "Value")
-
-p_components <- ggplot(component_curves, aes(x = days, y = Value, color = Component)) +
-  geom_line(linewidth = 1.3) +
-  geom_hline(yintercept = 0, linetype = "dashed", color = "gray50") +
-  geom_vline(xintercept = 45, linetype = "dotted", color = "gray40") +
-  scale_color_manual(values = c("Exit" = "red", "Entry" = "darkgreen", "Net" = "blue")) +
+  facet_wrap(~scheme, ncol = 1, scales = "free_x") +
+  scale_fill_brewer(palette = "Set2") +
   labs(
-    title = "Flow Decomposition: Exit, Entry, and Net Change",
-    subtitle = "All three components show rapid early activity, plateau by week 6-8",
-    x = "Days from Announcement",
-    y = "Flow (% of TSO for Exit/Entry, pp for Net)",
-    color = "Component"
+    title = "Exit Flow by Segmentation Scheme",
+    subtitle = "Comparing alternative phase definitions (ranked by F-statistic)",
+    x = "Phase",
+    y = "Exit flow (% of TSO)",
+    caption = sprintf("Best: %s (F=%.1f, p<%.3f)", 
+                     best_scheme, 
+                     comparison_table$F_stat_exit[1],
+                     comparison_table$p_value_exit[1])
   ) +
-  theme_minimal(base_size = 13) +
-  theme(legend.position = "bottom")
+  theme_pub +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1, size = 10),
+    legend.position = "none"
+  )
 
-print(p_components)
-ggsave("figure_velocity_components.png", p_components, width = 10, height = 7, dpi = 300)
+save_plot("09_segmentation_comparison", p_segmentation_compare, 10, 9)
 
-# ---- Summary Table -----------------------------------------------------------------------------
+#--------------------------------------------------------------------------------------------------
+# 7. EARLY WINDOW ZOOM (Days 1-14 detailed)
+#--------------------------------------------------------------------------------------------------
 
-summary_table <- tibble(
-  Component = c("Exit", "Entry", "Net Change"),
-  Best_Model = c(exit_models$best_name, entry_models$best_name, net_models$best_name),
-  R2 = c(
-    exit_models$comparison$R2[1],
-    entry_models$comparison$R2[1],
-    net_models$comparison$R2[1]
-  ),
-  Pred_Week2 = c(predictions_df$Exit_Est[predictions_df$Days == 15],
-                 predictions_df$Entry_Est[predictions_df$Days == 15],
-                 predictions_df$Net_Est[predictions_df$Days == 15]),
-  Pred_Week6 = c(predictions_df$Exit_Est[predictions_df$Days == 45],
-                 predictions_df$Entry_Est[predictions_df$Days == 45],
-                 predictions_df$Net_Est[predictions_df$Days == 45]),
-  Pred_Week10 = c(predictions_df$Exit_Est[predictions_df$Days == 75],
-                  predictions_df$Entry_Est[predictions_df$Days == 75],
-                  predictions_df$Net_Est[predictions_df$Days == 75])
+cat("\n7. EARLY WINDOW ANALYSIS (Days 1-14 in detail)\n")
+cat("-" %>% rep(80) %>% paste(collapse=""), "\n\n")
+
+early_window <- timing_data %>%
+  filter(days_to_qtr_end <= 14) %>%
+  mutate(
+    day_bin = case_when(
+      days_to_qtr_end <= 3 ~ "Days 1-3",
+      days_to_qtr_end <= 7 ~ "Days 4-7",
+      days_to_qtr_end <= 10 ~ "Days 8-10",
+      TRUE ~ "Days 11-14"
+    ),
+    day_bin = factor(day_bin, levels = c("Days 1-3", "Days 4-7", "Days 8-10", "Days 11-14"))
+  ) %>%
+  group_by(day_bin) %>%
+  summarise(
+    n = n(),
+    exit = mean(exit_pct, na.rm = TRUE),
+    exit_se = sd(exit_pct, na.rm = TRUE) / sqrt(n()),
+    entry = mean(entry_pct, na.rm = TRUE),
+    entry_se = sd(entry_pct, na.rm = TRUE) / sqrt(n()),
+    .groups = "drop"
+  )
+
+cat("Early Takeoff Analysis (first 14 days, by sub-period):\n")
+print(early_window, digits = 2)
+cat("\n")
+
+# Test if days 1-3 differ from 4-7
+if (nrow(timing_data %>% filter(days_to_qtr_end <= 3)) >= 5 &&
+    nrow(timing_data %>% filter(days_to_qtr_end > 3, days_to_qtr_end <= 7)) >= 5) {
+  
+  very_early <- timing_data %>% filter(days_to_qtr_end <= 3)
+  early <- timing_data %>% filter(days_to_qtr_end > 3, days_to_qtr_end <= 7)
+  
+  t_test_early <- t.test(early$exit_pct, very_early$exit_pct)
+  
+  cat(sprintf("Days 4-7 vs Days 1-3: Δ = %.2f pp (p=%.3f) %s\n",
+              mean(early$exit_pct, na.rm=TRUE) - mean(very_early$exit_pct, na.rm=TRUE),
+              t_test_early$p.value,
+              ifelse(t_test_early$p.value < 0.05, "*", "")))
+  
+  cat("\nInterpretation: ")
+  if (t_test_early$p.value < 0.05) {
+    cat("Significant acceleration in first week!\n")
+  } else {
+    cat("No significant difference in first week (gradual start).\n")
+  }
+}
+
+cat("\n")
+
+#--------------------------------------------------------------------------------------------------
+# 8. SAVE RESULTS
+#--------------------------------------------------------------------------------------------------
+
+segmentation_analysis <- list(
+  entry_breakpoint = entry_bp,
+  exit_breakpoints = exit_bp,
+  velocity_breakpoints = velocity_breakpoints,
+  comparison_table = comparison_table,
+  best_scheme = best_scheme,
+  best_result = best_result,
+  early_window = early_window,
+  all_results = segmentation_results
 )
 
-print(summary_table, digits = 2)
+saveRDS(segmentation_analysis, 
+        file.path(cfg$figures_dir, "segmentation_analysis.rds"))
 
-# ---- Save --------------------------------------------------------------------------------------
-
-velocity_results <- list(
-  weekly_data = weekly_agg,
-  exit_models = exit_models,
-  entry_models = entry_models,
-  net_models = net_models,
-  bootstrap = boot_df,
-  predictions = predictions_df,
-  summary = summary_table
-)
-
-saveRDS(velocity_results, "velocity_analysis_final.rds")
-
-cat("Key findings:\n")
-cat(sprintf("  • Exit plateaus at %.1f%% (R²=%.2f)\n", 
-            mean(predictions_df$Exit_Est), exit_models$comparison$R2[1]))
-cat(sprintf("  • Entry rises from %.1f%% to %.1f%%\n",
-            predictions_df$Entry_Est[1], predictions_df$Entry_Est[5]))
-cat(sprintf("  • Peak net decline at week 6: %.1f pp\n",
-            predictions_df$Net_Est[predictions_df$Days == 45]))
-cat(sprintf("  • Bootstrap validates non-linearity: %.0f%%\n\n", pct_nonlinear))
+cat("=" %>% rep(80) %>% paste(collapse=""), "\n")
+cat("SEGMENTATION ANALYSIS COMPLETE\n")
+cat("=" %>% rep(80) %>% paste(collapse=""), "\n\n")
 
 #=================================================================================================
 # STEP 16: STAYER ANALYSIS: Position Changes by Continuing Holders
