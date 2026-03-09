@@ -5355,6 +5355,519 @@ case_studies <- crossing(case_deals, panels) %>%
 
 print(case_studies, n = Inf)
 
+# ================================================================
+# TABLE_TYPECOMPOSITION AND NAMED INSTITUTION ANALYSIS
+# Extension to main replication script
+# Requires: flow_panel (from Step 12), wrds connection
+# Outputs:  Table_TypeComposition_TR, Table_TypeComposition_Unified,
+#           top_arb_firms, per_deal_offset_analysis
+# ================================================================
+
+# ---- Prerequisites ----------------------------------------------------
+library(dplyr)
+library(lubridate)
+
+sp <- function(x, label = NULL, ...) {
+  if (!is.null(label)) cat(sprintf("\n%s\n%s\n", label,
+                                    strrep("-", nchar(label))))
+  print(as_tibble(x), n = Inf, ...)
+}
+
+# ================================================================
+# SECTION A: INSTITUTIONAL TYPE CLASSIFICATION
+# ================================================================
+
+# ---- A1. TR typecodes (modal per mgrno) ----------------------------
+cat("Pulling TR typecodes...\n")
+tr_types_raw <- dbGetQuery(wrds, "
+  SELECT mgrno, typecode, mgrname
+  FROM tfn.s34type1
+  WHERE typecode IS NOT NULL
+")
+
+tr_type_modal <- tr_types_raw %>%
+  group_by(mgrno) %>%
+  summarise(
+    typecode_modal = as.integer(
+      names(sort(table(typecode), decreasing = TRUE))[1]),
+    mgrname_last   = dplyr::last(mgrname),
+    .groups        = "drop"
+  ) %>%
+  mutate(
+    type_label = case_when(
+      typecode_modal == 1L ~ "Banks & Trusts",
+      typecode_modal == 2L ~ "Insurance",
+      typecode_modal == 3L ~ "Mutual Funds",
+      typecode_modal == 4L ~ "Inv. Advisors",
+      typecode_modal == 5L ~ "Other",
+      TRUE                 ~ "Unknown"
+    ),
+    type_short = case_when(
+      typecode_modal == 1L ~ "Bank",
+      typecode_modal == 2L ~ "Insurance",
+      typecode_modal == 3L ~ "MutualFund",
+      typecode_modal == 4L ~ "InvAdvisor",
+      typecode_modal == 5L ~ "Other",
+      TRUE                 ~ "Unknown"
+    )
+  )
+
+saveRDS(tr_type_modal, "tr_type_modal.rds")
+
+# ---- A2. FactSet entity classification bridge ----------------------
+cat("Pulling FactSet entity classifications...\n")
+factset_crd_names <- dbGetQuery(wrds, "
+  SELECT i.factset_entity_id,
+         i.entity_id_value   AS crd,
+         n.entity_proper_name,
+         e.entity_sub_type,
+         e.manager_style
+  FROM factset_own.own_ent_inst_identifiers i
+  JOIN factset_own.own_ent_institutions e
+    ON i.factset_entity_id = e.factset_entity_id
+  JOIN (
+    SELECT factset_entity_id,
+           MAX(entity_proper_name) AS entity_proper_name
+    FROM factset_own.wrds_own_13f
+    GROUP BY factset_entity_id
+  ) n ON i.factset_entity_id = n.factset_entity_id
+  WHERE i.entity_id_type = 'CRD'
+    AND e.fds_13f_flag   = '1'
+") %>%
+  mutate(fs_name_clean = toupper(trimws(entity_proper_name)))
+
+wrds_13f_link_df <- dbGetQuery(wrds, "
+  SELECT DISTINCT cik, mgrno, coname, mgrname, flag
+  FROM wrdssec.wrds_13f_link
+  WHERE mgrno IS NOT NULL AND flag >= 2
+") %>%
+  mutate(
+    cik_name_clean = toupper(trimws(coname)),
+    mgr_name_clean = toupper(trimws(mgrname))
+  )
+
+b1 <- factset_crd_names %>%
+  inner_join(
+    wrds_13f_link_df %>% select(cik, mgrno, cik_name_clean, flag),
+    by = c("fs_name_clean" = "cik_name_clean")
+  ) %>%
+  rename(link_flag = flag) %>%
+  select(factset_entity_id, crd, mgrno,
+         entity_sub_type, manager_style, link_flag)
+
+b2 <- factset_crd_names %>%
+  inner_join(
+    wrds_13f_link_df %>% select(cik, mgrno, mgr_name_clean, flag),
+    by = c("fs_name_clean" = "mgr_name_clean")
+  ) %>%
+  rename(link_flag = flag) %>%
+  select(factset_entity_id, crd, mgrno,
+         entity_sub_type, manager_style, link_flag)
+
+fs_bridge <- bind_rows(b1, b2) %>%
+  distinct() %>%
+  group_by(mgrno) %>%
+  slice_max(link_flag, n = 1, with_ties = FALSE) %>%
+  ungroup()
+
+saveRDS(fs_bridge, "factset_bridge_final.rds")
+
+# ---- A3. Unified type lookup ---------------------------------------
+unified_lookup <- tr_type_modal %>%
+  left_join(
+    fs_bridge %>% select(mgrno, entity_sub_type, manager_style),
+    by = "mgrno"
+  ) %>%
+  mutate(
+    unified_short = case_when(
+      !is.na(entity_sub_type) ~ entity_sub_type,
+      typecode_modal == 1L    ~ "Bank",
+      typecode_modal == 2L    ~ "Insurance",
+      typecode_modal == 3L    ~ "MutualFund",
+      typecode_modal == 4L    ~ "InvAdvisor",
+      typecode_modal == 5L    ~ "Other_TR5",
+      TRUE                    ~ "Unknown"
+    ),
+    unified_label = case_when(
+      unified_short == "HF"         ~ "Hedge Fund",
+      unified_short == "IA"         ~ "Inv. Advisor",
+      unified_short == "MF"         ~ "Mutual Fund",
+      unified_short == "PB"         ~ "Private Banking",
+      unified_short == "PF"         ~ "Pension Fund",
+      unified_short == "IN"         ~ "Insurance",
+      unified_short == "BR"         ~ "Broker/Dealer",
+      unified_short == "CP"         ~ "Corporate",
+      unified_short == "VC"         ~ "Venture Capital",
+      unified_short == "FY"         ~ "Family Office",
+      unified_short == "FO"         ~ "Fund of Funds",
+      unified_short == "PP"         ~ "Public Pension",
+      unified_short == "RE"         ~ "Real Estate",
+      unified_short == "Bank"       ~ "Bank/Trust (TR)",
+      unified_short == "Insurance"  ~ "Insurance (TR)",
+      unified_short == "MutualFund" ~ "Mutual Fund (TR)",
+      unified_short == "InvAdvisor" ~ "Inv. Advisor (TR)",
+      unified_short == "Other_TR5"  ~ "Other (TR)",
+      TRUE                          ~ "Unknown"
+    ),
+    type_source = if_else(!is.na(entity_sub_type), "FactSet", "TR")
+  )
+
+saveRDS(unified_lookup, "unified_type_lookup.rds")
+
+# ================================================================
+# SECTION B: TYPE COMPOSITION TABLES
+# ================================================================
+
+# ---- B1. Merge type into flow_panel --------------------------------
+flow_unified <- flow_panel %>%
+  left_join(
+    unified_lookup %>%
+      select(mgrno, unified_short, unified_label,
+             type_source, entity_sub_type),
+    by = "mgrno"
+  )
+
+saveRDS(flow_unified, "flow_panel_unified.rds")
+
+# ---- B2. Type composition function ---------------------------------
+type_composition_unified <- function(df, label) {
+  df <- df %>%
+    filter(!is.na(unified_short), !is.na(TSO_tm1), TSO_tm1 > 0)
+
+  by_deal <- df %>%
+    group_by(master_deal_no, unified_short, unified_label) %>%
+    summarise(
+      TSO         = first(TSO_tm1),
+      sh_entry    = sum(shares_t0  * Entrant,  na.rm = TRUE),
+      sh_exit     = sum(shares_tm1 * Exiter,   na.rm = TRUE),
+      sh_stayer   = sum(shares_tm1 * Stayer,   na.rm = TRUE),
+      sh_baseline = sum(shares_tm1,             na.rm = TRUE),
+      .groups     = "drop"
+    ) %>%
+    mutate(
+      pct_entry    = sh_entry    / TSO * 100,
+      pct_exit     = sh_exit     / TSO * 100,
+      pct_stayer   = sh_stayer   / TSO * 100,
+      pct_baseline = sh_baseline / TSO * 100
+    )
+
+  deal_totals <- df %>%
+    group_by(master_deal_no) %>%
+    summarise(
+      tot_entry    = sum(shares_t0  * Entrant,  na.rm = TRUE),
+      tot_exit     = sum(shares_tm1 * Exiter,   na.rm = TRUE),
+      tot_stayer   = sum(shares_tm1 * Stayer,   na.rm = TRUE),
+      tot_baseline = sum(shares_tm1,             na.rm = TRUE),
+      .groups      = "drop"
+    )
+
+  by_deal %>%
+    left_join(deal_totals, by = "master_deal_no") %>%
+    mutate(
+      vol_entry    = if_else(tot_entry    > 0,
+                             sh_entry    / tot_entry,    NA_real_),
+      vol_exit     = if_else(tot_exit     > 0,
+                             sh_exit     / tot_exit,     NA_real_),
+      vol_stayer   = if_else(tot_stayer   > 0,
+                             sh_stayer   / tot_stayer,   NA_real_),
+      vol_baseline = if_else(tot_baseline > 0,
+                             sh_baseline / tot_baseline, NA_real_)
+    ) %>%
+    group_by(unified_short, unified_label) %>%
+    summarise(
+      mean_pct_baseline = mean(pct_baseline,  na.rm = TRUE),
+      mean_pct_exit     = mean(pct_exit,      na.rm = TRUE),
+      mean_pct_entry    = mean(pct_entry,     na.rm = TRUE),
+      mean_pct_stayer   = mean(pct_stayer,    na.rm = TRUE),
+      mean_vol_baseline = mean(vol_baseline,  na.rm = TRUE),
+      mean_vol_exit     = mean(vol_exit,      na.rm = TRUE),
+      mean_vol_entry    = mean(vol_entry,     na.rm = TRUE),
+      mean_vol_stayer   = mean(vol_stayer,    na.rm = TRUE),
+      n_deals           = n_distinct(master_deal_no),
+      .groups           = "drop"
+    ) %>%
+    mutate(
+      dev_exit   = mean_vol_exit   - mean_vol_baseline,
+      dev_entry  = mean_vol_entry  - mean_vol_baseline,
+      dev_stayer = mean_vol_stayer - mean_vol_baseline,
+      sample     = label
+    ) %>%
+    arrange(desc(mean_vol_baseline))
+}
+
+# ---- B3. Run all subsamples ----------------------------------------
+Table_TypeComposition_Unified <- bind_rows(
+  type_composition_unified(flow_unified,                                    "Full Sample"),
+  type_composition_unified(flow_unified %>% filter(!is.na(pct_cash),
+                                   pct_cash >= 75),  "Cash >=75%"),
+  type_composition_unified(flow_unified %>% filter(!is.na(pct_stk),
+                                   pct_stk  >= 75),  "Stock >=75%"),
+  type_composition_unified(flow_unified %>%
+                              filter(is.na(pct_cash) | pct_cash < 75) %>%
+                              filter(is.na(pct_stk)  | pct_stk  < 75),
+                                                      "Mixed/Other")
+) %>%
+  transmute(
+    Type              = unified_label,
+    Source            = if_else(
+                          !unified_short %in%
+                            c("Bank","Insurance","MutualFund",
+                              "InvAdvisor","Other_TR5","Unknown"),
+                          "FS", "TR"),
+    `Baseline %`      = round(mean_vol_baseline * 100, 1),
+    `Exiter %`        = round(mean_vol_exit     * 100, 1),
+    `Entrant %`       = round(mean_vol_entry    * 100, 1),
+    `Stayer %`        = round(mean_vol_stayer   * 100, 1),
+    `Exiter Dev`      = round(dev_exit          * 100, 1),
+    `Entrant Dev`     = round(dev_entry         * 100, 1),
+    `Stayer Dev`      = round(dev_stayer        * 100, 1),
+    `Entry pp TSO`    = round(mean_pct_entry,    2),
+    `Exit pp TSO`     = round(mean_pct_exit,     2),
+    `Baseline pp TSO` = round(mean_pct_baseline, 2),
+    N_Deals           = n_deals,
+    Sample            = sample
+  )
+
+saveRDS(Table_TypeComposition_Unified, "Table_TypeComposition_Unified.rds")
+
+# ================================================================
+# SECTION C: NAMED INSTITUTION ANALYSIS
+# ================================================================
+
+name_lookup <- tr_type_modal %>%
+  select(mgrno, mgrname_last, typecode_modal, type_label)
+
+# ---- C1. All entrants ranked ---------------------------------------
+total_entry_stats <- flow_panel %>%
+  filter(Entrant == 1, !is.na(TSO_tm1), TSO_tm1 > 0) %>%
+  summarise(
+    total_vol    = sum(shares_t0 / TSO_tm1 * 100, na.rm = TRUE),
+    total_events = n(),
+    n_firms      = n_distinct(mgrno)
+  )
+
+all_entrants_ranked <- flow_panel %>%
+  filter(Entrant == 1, !is.na(TSO_tm1), TSO_tm1 > 0) %>%
+  group_by(mgrno) %>%
+  summarise(
+    n_deals         = n_distinct(master_deal_no),
+    n_events        = n(),
+    total_entry_vol = sum(shares_t0 / TSO_tm1 * 100, na.rm = TRUE),
+    mean_entry_vol  = mean(shares_t0 / TSO_tm1 * 100, na.rm = TRUE),
+    .groups         = "drop"
+  ) %>%
+  arrange(desc(total_entry_vol)) %>%
+  mutate(
+    pct_of_all_entry = total_entry_vol / total_entry_stats$total_vol * 100,
+    cum_pct_entry    = cumsum(pct_of_all_entry),
+    rank             = row_number()
+  ) %>%
+  left_join(name_lookup,                                   by = "mgrno") %>%
+  left_join(fs_bridge %>% select(mgrno, entity_sub_type),  by = "mgrno")
+
+# ---- C2. Top 1% repeat entrants (the arb candidates) ---------------
+repeat_entrants <- flow_panel %>%
+  filter(Entrant == 1, !is.na(TSO_tm1), TSO_tm1 > 0) %>%
+  group_by(mgrno) %>%
+  summarise(
+    n_entry_deals   = n_distinct(master_deal_no),
+    n_entry_events  = n(),
+    total_entry_vol = sum(shares_t0 / TSO_tm1 * 100, na.rm = TRUE),
+    mean_entry_vol  = mean(shares_t0 / TSO_tm1 * 100, na.rm = TRUE),
+    .groups         = "drop"
+  ) %>%
+  filter(n_entry_deals >= 3) %>%
+  arrange(desc(total_entry_vol)) %>%
+  mutate(
+    row_rank            = row_number(),
+    pct_of_repeat_entry = total_entry_vol / sum(total_entry_vol) * 100,
+    pct_of_all_entry    = total_entry_vol /
+                          total_entry_stats$total_vol * 100,
+    cum_pct_repeat      = cumsum(pct_of_repeat_entry),
+    cum_pct_all         = cumsum(pct_of_all_entry)
+  )
+
+top_arb_n     <- ceiling(nrow(repeat_entrants) * 0.01)
+top_arb_mgnos <- repeat_entrants %>%
+  slice_head(n = top_arb_n) %>%
+  pull(mgrno)
+
+top_arb_full <- repeat_entrants %>%
+  slice_head(n = top_arb_n) %>%
+  left_join(name_lookup, by = "mgrno") %>%
+  left_join(
+    flow_panel %>%
+      filter(mgrno %in% top_arb_mgnos,
+             Exiter == 1, !is.na(TSO_tm1), TSO_tm1 > 0) %>%
+      group_by(mgrno) %>%
+      summarise(
+        n_exit_events  = n(),
+        total_exit_vol = sum(shares_tm1 / TSO_tm1 * 100, na.rm = TRUE),
+        .groups        = "drop"
+      ),
+    by = "mgrno"
+  ) %>%
+  left_join(
+    flow_panel %>%
+      filter(mgrno %in% top_arb_mgnos, Stayer == 1) %>%
+      group_by(mgrno) %>%
+      summarise(n_stay_events = n(), .groups = "drop"),
+    by = "mgrno"
+  ) %>%
+  left_join(fs_bridge %>% select(mgrno, entity_sub_type), by = "mgrno") %>%
+  mutate(
+    n_exit_events  = coalesce(n_exit_events,  0L),
+    total_exit_vol = coalesce(total_exit_vol,  0),
+    n_stay_events  = coalesce(n_stay_events,  0L),
+    total_obs      = n_entry_events + n_exit_events + n_stay_events,
+    pct_enter      = round(100 * n_entry_events / total_obs, 1),
+    pct_exit       = round(100 * n_exit_events  / total_obs, 1),
+    pct_stay       = round(100 * n_stay_events  / total_obs, 1),
+    entry_exit_ratio = round(
+      pmin(total_entry_vol /
+             if_else(total_exit_vol > 0, total_exit_vol, NA_real_),
+           10), 2),
+    arb_signal = case_when(
+      pct_enter >= 80 & (is.na(entry_exit_ratio) |
+                         entry_exit_ratio >= 2)  ~ "Pure arb",
+      pct_enter >= 50 & pct_stay < 30            ~ "Probable arb",
+      pct_enter >= 30 & pct_exit > pct_stay      ~ "Event-driven",
+      TRUE                                        ~ "Mixed"
+    )
+  ) %>%
+  arrange(desc(total_entry_vol))
+
+saveRDS(top_arb_full, "top_arb_firms_named.rds")
+
+# ---- C3. Per-deal offset analysis ----------------------------------
+# Named large fund universe
+known_large_pattern <- paste(c(
+  "VANGUARD", "BLACKROCK", "FIDELITY MGMT", "STATE STR",
+  "DIMENSIONAL", "T\\. ROWE", "WELLINGTON", "BARCLAYS",
+  "MELLON", "NORTHERN TRUST", "INVESCO", "JPMORGAN",
+  "GOLDMAN SACHS", "MORGAN STANLEY", "PIMCO",
+  "CAPITAL RESEARCH", "DODGE.*COX", "OPPENHEIMER",
+  "PUTNAM", "ALLIANZ", "MFS INVEST", "LORD.*ABBETT"
+), collapse = "|")
+
+large_fund_mgnos <- name_lookup %>%
+  filter(grepl(known_large_pattern, mgrname_last,
+               ignore.case = TRUE)) %>%
+  pull(mgrno)
+
+active_large_mgnos <- flow_panel %>%
+  filter(mgrno %in% large_fund_mgnos,
+         !is.na(TSO_tm1), TSO_tm1 > 0) %>%
+  group_by(mgrno) %>%
+  summarise(
+    pct_exit       = mean(Exiter, na.rm = TRUE) * 100,
+    total_exit_vol = sum(shares_tm1 * Exiter / TSO_tm1 * 100,
+                         na.rm = TRUE),
+    .groups        = "drop"
+  ) %>%
+  filter(pct_exit >= 5, total_exit_vol > 1) %>%
+  pull(mgrno)
+
+arb_mgnos <- top_arb_full %>%
+  filter(arb_signal %in% c("Pure arb", "Probable arb")) %>%
+  pull(mgrno)
+
+per_deal_offset <- flow_panel %>%
+  filter(!is.na(TSO_tm1), TSO_tm1 > 0) %>%
+  group_by(master_deal_no) %>%
+  summarise(
+    TSO = first(TSO_tm1),
+    arb_entry_pct         = sum(shares_t0  * Entrant *
+                                (mgrno %in% arb_mgnos)        /
+                                TSO_tm1 * 100, na.rm = TRUE),
+    top27_entry_pct       = sum(shares_t0  * Entrant *
+                                (mgrno %in% top_arb_full$mgrno)/
+                                TSO_tm1 * 100, na.rm = TRUE),
+    total_entry_pct       = sum(shares_t0  * Entrant          /
+                                TSO_tm1 * 100, na.rm = TRUE),
+    large_exit_pct        = sum(shares_tm1 * Exiter *
+                                (mgrno %in% large_fund_mgnos)  /
+                                TSO_tm1 * 100, na.rm = TRUE),
+    active_large_exit_pct = sum(shares_tm1 * Exiter *
+                                (mgrno %in% active_large_mgnos)/
+                                TSO_tm1 * 100, na.rm = TRUE),
+    total_exit_pct        = sum(shares_tm1 * Exiter            /
+                                TSO_tm1 * 100, na.rm = TRUE),
+    .groups               = "drop"
+  ) %>%
+  left_join(
+    flow_panel %>% distinct(master_deal_no, pct_cash, pct_stk),
+    by = "master_deal_no"
+  ) %>%
+  mutate(
+    deal_type = case_when(
+      !is.na(pct_cash) & pct_cash >= 75 ~ "Cash",
+      !is.na(pct_stk)  & pct_stk  >= 75 ~ "Stock",
+      TRUE                               ~ "Mixed"
+    ),
+    arb_as_pct_of_exit = arb_entry_pct /
+                         pmax(total_exit_pct, 0.001) * 100,
+    arb_exceeds_large  = arb_entry_pct > large_exit_pct
+  )
+
+saveRDS(per_deal_offset, "per_deal_offset_analysis.rds")
+
+# ---- C4. Summary statistics for paper ------------------------------
+cat("\n", strrep("=", 65), "\n")
+cat("NAMED INSTITUTION ANALYSIS — SUMMARY FOR PAPER\n")
+cat(strrep("=", 65), "\n\n")
+
+cat(sprintf(
+  "Sample: %d deals, %d unique entering institutions\n\n",
+  n_distinct(per_deal_offset$master_deal_no),
+  total_entry_stats$n_firms))
+
+cat("ENTRY CONCENTRATION\n")
+for (k in c(5, 10, 27, 50, 100)) {
+  r <- all_entrants_ranked %>% slice(k)
+  cat(sprintf("  Top %3d entrants: %5.1f%% of all institutional entry\n",
+              k, r$cum_pct_entry))
+}
+
+cat(sprintf(
+  "\nTop 1%% of repeat entrants (%d firms, all entering 3+ deals):\n",
+  top_arb_n))
+cat(sprintf(
+  "  %.1f%% of repeat-entrant volume | %.1f%% of total entry volume\n",
+  max(top_arb_full$cum_pct_repeat),
+  sum(top_arb_full$pct_of_all_entry)))
+cat(sprintf(
+  "  %d of %d (%.0f%%) show pure/probable arb behavioral signature\n\n",
+  sum(top_arb_full$arb_signal %in% c("Pure arb","Probable arb")),
+  top_arb_n,
+  100 * mean(top_arb_full$arb_signal %in%
+               c("Pure arb","Probable arb"))))
+
+cat("PER-DEAL FLOWS (mean % of target shares outstanding)\n")
+cat(sprintf("  Arb fund entry (Pure+Probable arb, top 100): %5.1f%% TSO\n",
+            mean(per_deal_offset$arb_entry_pct)))
+cat(sprintf("  Total institutional entry:                   %5.1f%% TSO\n",
+            mean(per_deal_offset$total_entry_pct)))
+cat(sprintf("  Total institutional exit:                    %5.1f%% TSO\n",
+            mean(per_deal_offset$total_exit_pct)))
+cat(sprintf("  Arb entry as share of total exit:            %5.1f%%\n\n",
+            mean(per_deal_offset$arb_as_pct_of_exit)))
+
+cat("PER-DEAL FLOWS BY DEAL TYPE\n")
+per_deal_offset %>%
+  group_by(deal_type) %>%
+  summarise(
+    n                   = n(),
+    mean_arb_entry      = mean(arb_entry_pct,   na.rm=TRUE),
+    mean_total_exit     = mean(total_exit_pct,  na.rm=TRUE),
+    arb_pct_of_exit     = mean(arb_as_pct_of_exit, na.rm=TRUE),
+    pct_arb_exceeds_lf  = mean(arb_exceeds_large,  na.rm=TRUE)*100,
+    .groups             = "drop"
+  ) %>%
+  mutate(across(where(is.numeric), ~round(., 1))) %>%
+  { sp(., "By deal type") }
+
+				 
 #=================================================================================================
 # STEP 21: Combined Output
 #=================================================================================================
