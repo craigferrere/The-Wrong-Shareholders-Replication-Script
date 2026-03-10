@@ -4660,6 +4660,299 @@ cat("  • Medium holders: 6.4% of stayers, 40.4% of $ trims\n")
 cat("  • Large holders: 1.5% of stayers, 23.8% of $ trims\n")
 cat("  → Medium holders DOMINATE capital flows\n\n")
 
+# ================================================================
+# PRE-ANNOUNCEMENT CO-OWNERSHIP PROFILE: OPTION A + OPTION B
+#
+# OPTION A — Fixed classification:
+#   Stayer/Exiter defined once at t=0 looking backwards.
+#   At every event time, set A is restricted to managers we know
+#   will eventually stay (or exit). B = acquirer holders at that time.
+#
+# OPTION B — Rolling classification (mechanism/control):
+#   At event time t, a "rolling stayer" held the target at BOTH t and t+1.
+#   A "rolling exiter" held at t but NOT at t+1.
+#   This captures who is actively deciding to leave each quarter.
+# ================================================================
+
+# ---- SHARED STEP 1: Deal reference for ALL event times ----
+# One row per (master_deal_no, event_time) with rdate, tgt_permno, acq_permno
+
+deal_ref_all_times <- full_panel %>%
+  filter(
+    firm_type  == "target",
+    event_time %in% c(-4, -3, -2, -1),
+    !is.na(acquirer_permno)
+  ) %>%
+  group_by(master_deal_no, event_time, rdate, target_permno, acquirer_permno) %>%
+  summarise(n_mgrs = n(), .groups = "drop") %>%
+  group_by(master_deal_no, event_time) %>%
+  slice_max(n_mgrs, n = 1, with_ties = FALSE) %>%
+  ungroup() %>%
+  select(
+    master_deal_no,
+    event_time,
+    ref_rdate  = rdate,
+    tgt_permno = target_permno,
+    acq_permno = acquirer_permno
+  )
+
+# Verify: one row per (deal, event_time)
+stopifnot(
+  deal_ref_all_times %>%
+    count(master_deal_no, event_time) %>%
+    pull(n) %>%
+    max() == 1
+)
+cat(sprintf("deal_ref_all_times: %d rows (%d deals × up to 4 event times)\n",
+            nrow(deal_ref_all_times),
+            n_distinct(deal_ref_all_times$master_deal_no)))
+
+# ---- SHARED STEP 2: Pre-filter granular to relevant dates only ----
+
+relevant_rdates <- unique(deal_ref_all_times$ref_rdate)
+cat(sprintf("Distinct reference dates: %d\n", length(relevant_rdates)))
+
+granular_slim <- institutional_holdings_granular %>%
+  filter(rdate %in% relevant_rdates, shares_adj > 0) %>%
+  select(mgrno, permno, rdate)
+
+cat(sprintf("Granular rows at relevant dates: %d\n", nrow(granular_slim)))
+
+# ---- SHARED STEP 3: Core set builder function ----
+# Given a set of (master_deal_no, mgrno) pairs defining set A,
+# and deal_ref rows defining (tgt_permno, acq_permno, ref_rdate),
+# compute |A|, |B|, |A∩B| per deal.
+
+compute_set_co <- function(set_A, deal_ref_subset, label) {
+  # set_A: data frame with (master_deal_no, mgrno) — the restricted holder set
+  # deal_ref_subset: data frame with (master_deal_no, ref_rdate, acq_permno)
+  
+  # |A| per deal
+  size_A <- set_A %>%
+    group_by(master_deal_no) %>%
+    summarise(n_A = n_distinct(mgrno), .groups = "drop")
+  
+  # B: all managers holding the acquirer at ref_rdate
+  set_B <- deal_ref_subset %>%
+    select(master_deal_no, permno = acq_permno, rdate = ref_rdate) %>%
+    inner_join(granular_slim, by = c("permno", "rdate")) %>%
+    select(master_deal_no, mgrno)
+  
+  # |A ∩ B|: managers in set_A who also held the acquirer
+  size_intersection <- set_A %>%
+    inner_join(set_B, by = c("master_deal_no", "mgrno")) %>%
+    group_by(master_deal_no) %>%
+    summarise(n_intersection = n_distinct(mgrno), .groups = "drop")
+  
+  # Combine
+  deal_ref_subset %>%
+    select(master_deal_no) %>%
+    left_join(size_A,            by = "master_deal_no") %>%
+    left_join(size_intersection, by = "master_deal_no") %>%
+    replace_na(list(n_A = 0, n_intersection = 0)) %>%
+    mutate(
+      co_rate = n_intersection / n_A,
+      group   = label
+    )
+}
+
+# ================================================================
+# OPTION A — FIXED CLASSIFICATION
+# Stayer/Exiter defined once. Classification applied at every event time.
+# ================================================================
+
+cat("\n=== OPTION A: FIXED CLASSIFICATION ===\n")
+
+# Fixed stayer and exiter manager sets (from flow_panel_unified)
+fixed_stayers <- flow_panel %>%
+  filter(Stayer == 1) %>%
+  distinct(master_deal_no, mgrno)
+
+fixed_exiters <- flow_panel %>%
+  filter(Exiter == 1) %>%
+  distinct(master_deal_no, mgrno)
+
+cat(sprintf("Fixed stayer pairs:  %d\n", nrow(fixed_stayers)))
+cat(sprintf("Fixed exiter pairs:  %d\n", nrow(fixed_exiters)))
+
+# For each event time, restrict set_A to fixed stayers/exiters
+# but use the holdings that actually existed at THAT event time's rdate
+
+option_a_results <- map_dfr(c(-4, -3, -2, -1), function(et) {
+  
+  ref_this_time <- deal_ref_all_times %>%
+    filter(event_time == et)
+  
+  # Set A = fixed stayers who appear in deals covered at this event time
+  stayer_A <- fixed_stayers %>%
+    semi_join(ref_this_time, by = "master_deal_no")
+  
+  exiter_A <- fixed_exiters %>%
+    semi_join(ref_this_time, by = "master_deal_no")
+  
+  # But we need stayers to have actually held the TARGET at this event time
+  # (they may not have been holders yet at t=-4)
+  target_holders_this_time <- ref_this_time %>%
+    select(master_deal_no, permno = tgt_permno, rdate = ref_rdate) %>%
+    inner_join(granular_slim, by = c("permno", "rdate")) %>%
+    select(master_deal_no, mgrno)
+  
+  stayer_A_active <- stayer_A %>%
+    inner_join(target_holders_this_time, by = c("master_deal_no", "mgrno"))
+  
+  exiter_A_active <- exiter_A %>%
+    inner_join(target_holders_this_time, by = c("master_deal_no", "mgrno"))
+  
+  stayer_res <- compute_set_co(stayer_A_active, ref_this_time, "Stayer (fixed)")
+  exiter_res <- compute_set_co(exiter_A_active, ref_this_time, "Exiter (fixed)")
+  
+  bind_rows(stayer_res, exiter_res) %>%
+    mutate(event_time = et)
+})
+
+cat("\nOption A — mean co-ownership by event time and group:\n")
+option_a_results %>%
+  group_by(event_time, group) %>%
+  summarise(
+    n_deals   = n(),
+    mean_co   = round(mean(co_rate, na.rm=TRUE) * 100, 1),
+    median_co = round(median(co_rate, na.rm=TRUE) * 100, 1),
+    .groups   = "drop"
+  ) %>%
+  arrange(group, event_time) %>%
+  print(n = 20)
+
+# ================================================================
+# OPTION B — ROLLING CLASSIFICATION (mechanism / control)
+# At event time t:
+#   Rolling stayer:  held target at t AND at t+1
+#   Rolling exiter:  held target at t but NOT at t+1
+# Classification is derived purely from holdings — no flow_panel needed.
+# ================================================================
+
+cat("\n=== OPTION B: ROLLING CLASSIFICATION ===\n")
+
+# Build target holdings at each event time as a flat table
+# (master_deal_no, mgrno, event_time)
+
+target_holders_by_time <- map_dfr(c(-4, -3, -2, -1), function(et) {
+  ref <- deal_ref_all_times %>% filter(event_time == et)
+  
+  ref %>%
+    select(master_deal_no, permno = tgt_permno, rdate = ref_rdate) %>%
+    inner_join(granular_slim, by = c("permno", "rdate")) %>%
+    select(master_deal_no, mgrno) %>%
+    mutate(event_time = et)
+})
+
+cat(sprintf("Target holder observations (all event times): %d\n",
+            nrow(target_holders_by_time)))
+
+# Rolling classification: for each (deal, manager, t),
+# did they also hold at t+1?
+rolling_flags <- target_holders_by_time %>%
+  rename(event_time_t = event_time) %>%
+  left_join(
+    target_holders_by_time %>%
+      mutate(event_time = event_time - 1) %>%  # shift: t+1 record matches t
+      rename(event_time_t = event_time) %>%
+      mutate(held_next = TRUE) %>%
+      select(master_deal_no, mgrno, event_time_t, held_next),
+    by = c("master_deal_no", "mgrno", "event_time_t")
+  ) %>%
+  replace_na(list(held_next = FALSE)) %>%
+  mutate(
+    rolling_type = case_when(
+      held_next  ~ "Rolling stayer",
+      !held_next ~ "Rolling exiter"
+    )
+  )
+
+cat("\nRolling classification counts by event time:\n")
+rolling_flags %>%
+  count(event_time_t, rolling_type) %>%
+  arrange(rolling_type, event_time_t) %>%
+  print(n = 20)
+
+# Note: at t=-1, ALL holders are "rolling exiters" by this definition
+# because we have no t=0 target holding (target is absorbed in the deal).
+# Exclude t=-1 from rolling exiter interpretation, or use flow_panel Stayer flag.
+cat("\nNOTE: at t=-1, 'rolling exiter' means 'did not hold target at t=0'\n")
+cat("      which conflates true exiters with managers who held through deal close.\n")
+cat("      Consider using fixed Stayer/Exiter for t=-1 only.\n")
+
+# Compute co-ownership for each rolling group × event time
+option_b_results <- map_dfr(c(-4, -3, -2, -1), function(et) {
+  
+  ref_this_time <- deal_ref_all_times %>%
+    filter(event_time == et)
+  
+  flags_this_time <- rolling_flags %>%
+    filter(event_time_t == et)
+  
+  stayer_A <- flags_this_time %>%
+    filter(rolling_type == "Rolling stayer") %>%
+    select(master_deal_no, mgrno)
+  
+  exiter_A <- flags_this_time %>%
+    filter(rolling_type == "Rolling exiter") %>%
+    select(master_deal_no, mgrno)
+  
+  stayer_res <- compute_set_co(stayer_A, ref_this_time, "Rolling stayer")
+  exiter_res <- compute_set_co(exiter_A, ref_this_time, "Rolling exiter")
+  
+  bind_rows(stayer_res, exiter_res) %>%
+    mutate(event_time = et)
+})
+
+cat("\nOption B — mean co-ownership by event time and group:\n")
+option_b_results %>%
+  group_by(event_time, group) %>%
+  summarise(
+    n_deals   = n(),
+    mean_co   = round(mean(co_rate, na.rm=TRUE) * 100, 1),
+    median_co = round(median(co_rate, na.rm=TRUE) * 100, 1),
+    .groups   = "drop"
+  ) %>%
+  arrange(group, event_time) %>%
+  print(n = 20)
+
+# ================================================================
+# COMBINED SUMMARY TABLE — READY FOR PAPER
+# ================================================================
+
+cat("\n=== COMBINED SUMMARY: OPTION A vs OPTION B ===\n")
+
+summary_A <- option_a_results %>%
+  group_by(event_time, group) %>%
+  summarise(
+    mean_co   = round(mean(co_rate, na.rm=TRUE) * 100, 1),
+    median_co = round(median(co_rate, na.rm=TRUE) * 100, 1),
+    n_deals   = n(),
+    .groups   = "drop"
+  ) %>%
+  mutate(method = "Fixed")
+
+summary_B <- option_b_results %>%
+  group_by(event_time, group) %>%
+  summarise(
+    mean_co   = round(mean(co_rate, na.rm=TRUE) * 100, 1),
+    median_co = round(median(co_rate, na.rm=TRUE) * 100, 1),
+    n_deals   = n(),
+    .groups   = "drop"
+  ) %>%
+  mutate(method = "Rolling")
+
+bind_rows(summary_A, summary_B) %>%
+  arrange(method, group, event_time) %>%
+  print(n = 40)
+
+# Save
+saveRDS(option_a_results, "co_option_a_fixed.rds")
+saveRDS(option_b_results, "co_option_b_rolling.rds")
+saveRDS(rolling_flags,    "rolling_classification_flags.rds")
+cat("\nSaved all three objects\n")
+									  
 #=================================================================================================
 # STEP 18: Insider Ownership at Announcement
 # Input:  deals_with_io, target_panel, wrds connection
